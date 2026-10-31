@@ -1,4 +1,4 @@
-# App Name
+# ECO QUEST
 
 A React Native mobile application built for IAT351, focusing on Human-Computer Interaction (HCI) design principles, gamified climate action habit loops, and a structured peer-to-peer sustainability award economy.
 
