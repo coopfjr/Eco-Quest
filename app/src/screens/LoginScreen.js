@@ -32,7 +32,7 @@ export default function LoginScreen({ navigation }) {
           <View style={styles.iconCircle}>
             <Ionicons name="leaf" size={48} color="#2D6A4F" />
           </View>
-          <Text style={styles.appTitle}>APPP NAME</Text>
+          <Text style={styles.appTitle}>Eco Quest</Text>
           <Text style={styles.tagline}>Track & Share Your Daily Actions</Text>
         </View>
 

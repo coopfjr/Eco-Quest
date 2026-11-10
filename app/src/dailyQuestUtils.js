@@ -120,7 +120,7 @@ const completeDailyQuest = async (questId, points) => {
   }
 };
 
-const rerollDailyQuest = async (currentQuestId) => {
+const rerollDailyQuest = async (currentQuestId, targetMode = 'same') => {
   const user = auth.currentUser;
   if (!user) return { success: false, message: "User not logged in." };
 
@@ -135,22 +135,34 @@ const rerollDailyQuest = async (currentQuestId) => {
     let quests = userData?.dailyQuests || [];
     let userInterests = userData?.interests || [];
 
+    const questIndex = quests.findIndex(q => q.questId === currentQuestId);
+    if (questIndex === -1) return { success: false, message: "Quest not found." };
+
+    const currentDiff = quests[questIndex].difficulty;
+    let targetDifficulty = currentDiff;
+
+    if (targetMode === 'downgrade') {
+      if (currentDiff === 'Hard') targetDifficulty = 'Medium';
+      else if (currentDiff === 'Medium') targetDifficulty = 'Easy';
+      else return { success: false, message: "Quest is already at Easy difficulty." };
+    } else if (targetMode === 'upgrade') {
+      if (currentDiff === 'Easy') targetDifficulty = 'Medium';
+      else if (currentDiff === 'Medium') targetDifficulty = 'Hard';
+      else return { success: false, message: "Quest is already at Hard difficulty." };
+    }
+
     if (availableTokens > 0) {
       availableTokens -= 1; 
     } else if (currentScore >= REROLL_COST) {
       currentScore -= REROLL_COST; 
     } else {
-      return { success: false, message: `Reroll requires ${REROLL_COST} points or 1 token.` };
+      return { success: false, message: `Requires ${REROLL_COST} points or 1 token.` };
     }
     
-    const questIndex = quests.findIndex(q => q.questId === currentQuestId);
-    if (questIndex === -1) return { success: false, message: "Quest not found." };
-
-    const originalDifficulty = quests[questIndex].difficulty;
     const snap = await getDocs(collection(db, "Quests"));
     const available = snap.docs
       .map(d => ({ id: d.id, ...d.data() }))
-      .filter(q => q.id !== currentQuestId && q.difficulty === originalDifficulty); 
+      .filter(q => q.id !== currentQuestId && q.difficulty === targetDifficulty); 
 
     let newQuest = null;
     const preferred = available.filter(d => d.tags && d.tags.some(t => userInterests.includes(t)));
@@ -160,7 +172,7 @@ const rerollDailyQuest = async (currentQuestId) => {
     } else if (available.length > 0) {
       newQuest = available[Math.floor(Math.random() * available.length)];
     } else {
-      return { success: false, message: "No unique quests available." };
+      return { success: false, message: `No alternative ${targetDifficulty} quests available.` };
     }
     
     const newQuestObj = {
@@ -176,7 +188,7 @@ const rerollDailyQuest = async (currentQuestId) => {
     quests[questIndex] = newQuestObj;
     await updateDoc(userDocRef, { dailyQuests: quests, rerollTokens: availableTokens, score: currentScore });
 
-    return { success: true, message: `Swapped to: ${newQuest.title}`, newQuest: newQuestObj };
+    return { success: true, message: `Swapped to (${targetDifficulty}): ${newQuest.title}`, newQuest: newQuestObj };
   } catch (error) {
     console.error("Error rerolling quest:", error);
     return { success: false, message: "Error during reroll." };

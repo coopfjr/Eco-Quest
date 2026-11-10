@@ -7,6 +7,7 @@ import AppTabs from './src/AppTabs.js';
 import LoadingScreen from './src/screens/LoadingScreen.js'; 
 import { auth } from './src/firebaseConfig.js';
 import { seedQuests } from './src/firestoreUtils.js';
+import { syncOfflinePosts } from './src/offlineSyncUtils.js';
 
 export default function App() {
   const [initializing, setInitializing] = useState(true); 
@@ -14,6 +15,7 @@ export default function App() {
 
   useEffect(() => {
     seedQuests();
+    syncOfflinePosts();
     const unsubscribe = auth.onAuthStateChanged((currentUser) => {
       setUser(currentUser);
       if (initializing) setTimeout(() => setInitializing(false), 1000);

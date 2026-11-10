@@ -84,7 +84,6 @@ export default function OnboardingScreen() {
       <View style={[styles.headerContainer, { marginTop: insets.top + 15 }]}>
         <Ionicons name="earth" size={65} color="#fff" />
         
-        {/* Updated Pagination to 5 dots */}
         <View style={styles.pagination}>
           <View style={[styles.dot, step === 0 && styles.activeDot]} />
           <View style={[styles.dot, step === 1 && styles.activeDot]} />
@@ -109,8 +108,8 @@ export default function OnboardingScreen() {
             <View style={styles.iconCircle}>
               <Ionicons name="leaf" size={40} color="#2D6A4F" />
             </View>
-            <Text style={styles.cardHeader}>Welcome to (App Name)</Text>
-            <Text style={styles.bodyText}>Turn climate anxiety into positive action. (App Name) gives you bite-sized daily challenges that make a real-world environmental impact.</Text>
+            <Text style={styles.cardHeader}>Welcome to Eco Quest</Text>
+            <Text style={styles.bodyText}>Turn climate anxiety into positive action. Eco Quest gives you bite-sized daily challenges that make a real-world environmental impact.</Text>
           </View>
         </View>
 
@@ -164,7 +163,7 @@ export default function OnboardingScreen() {
           </View>
         </View>
 
-        {/* Slide 3 (NEW) */}
+        {/* Slide 3 */}
         <View style={styles.slide}>
           <View style={styles.card}>
             <Text style={styles.cardHeader}>Ranks & Rewards</Text>

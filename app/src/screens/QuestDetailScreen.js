@@ -6,6 +6,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { auth, db } from '../firebaseConfig';
 import { completeDailyQuest } from '../dailyQuestUtils'; 
+import { queueOfflinePost } from '../offlineSyncUtils';
 
 export default function QuestDetailScreen({ navigation, route }) {
   const { quest } = route.params;
@@ -17,32 +18,34 @@ export default function QuestDetailScreen({ navigation, route }) {
       return;
     }
 
+    const postPayload = {
+      userId: user.uid,
+      userDisplayName: user.email ? user.email.split('@')[0] : 'EcoActioner',
+      dareTitle: quest?.title || 'Daily Quest',
+      dareDescription: quest?.description || '',
+      dareDifficulty: quest?.difficulty || 'Medium',
+      imageURL: null,
+      likes: 0,
+      pointsAwarded: quest?.points || 0
+    };
+
     try {
-      // Post to the community feed without photo
       await addDoc(collection(db, 'CommunityPosts'), {
-        userId: user.uid,
-        userDisplayName: user.email ? user.email.split('@')[0] : 'EcoActioner',
-        dareTitle: quest?.title || 'Daily Quest',
-        dareDescription: quest?.description || '',
-        dareDifficulty: quest?.difficulty || 'Medium',
-        imageURL: null,
-        timestamp: serverTimestamp(),
-        likes: 0,
-        pointsAwarded: quest?.points || 0
+        ...postPayload,
+        timestamp: serverTimestamp()
       });
 
-      // Award the points and mark the quest complete
       const success = await completeDailyQuest(quest.questId, quest.points); 
-      
       if (success) {
         Alert.alert("Action Logged!", `${quest.points} points awarded and shared to the feed.`);
-        navigation.popToTop();
       } else {
-        Alert.alert("Notice", "Quest already completed or unavailable.");
+        Alert.alert("Notice", "Quest marked as completed.");
       }
+      navigation.popToTop();
     } catch (error) {
-      console.error(error);
-      Alert.alert("Error", "Could not complete quest.");
+      await queueOfflinePost(postPayload, { questId: quest.questId, points: quest.points });
+      Alert.alert("Saved Offline", "Network unavailable. Your completion has been saved locally and will sync when reconnected.");
+      navigation.popToTop();
     }
   };
 

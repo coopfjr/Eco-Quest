@@ -4,8 +4,10 @@ import { View, Text, StyleSheet, ActivityIndicator, FlatList, TouchableOpacity, 
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons'; 
 import { db, auth } from '../firebaseConfig';
-import { collection, query, orderBy, limit, getDocs, getDoc, doc, runTransaction, increment, updateDoc, arrayUnion, arrayRemove, deleteDoc } from 'firebase/firestore';
+import { collection, query, orderBy, limit, startAfter, getDocs, getDoc, doc, runTransaction, increment, updateDoc, arrayUnion, arrayRemove, deleteDoc } from 'firebase/firestore';
 import * as Haptics from 'expo-haptics';
+
+const PAGE_SIZE = 10;
 
 const AWARDS = [
   { id: 'leaf', icon: '🌱', name: 'Sprout', cost: 10 },
@@ -45,6 +47,9 @@ export default function CommunityScreen() {
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [lastFeedDoc, setLastFeedDoc] = useState(null);
+  const [hasMoreFeed, setHasMoreFeed] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   const loadData = useCallback(async () => {
     try {
@@ -66,7 +71,7 @@ export default function CommunityScreen() {
       const ranked = users.map((u, i) => ({ ...u, rank: i + 1 }));
       setLeaderboard(ranked);
 
-      const qFeed = query(collection(db, 'CommunityPosts'), orderBy('timestamp', 'desc'), limit(50));
+      const qFeed = query(collection(db, 'CommunityPosts'), orderBy('timestamp', 'desc'), limit(PAGE_SIZE));
       const snapFeed = await getDocs(qFeed);
       const posts = [];
       
@@ -86,6 +91,12 @@ export default function CommunityScreen() {
         }
       }
       setFeed(posts);
+      if (snapFeed.docs.length > 0) {
+        setLastFeedDoc(snapFeed.docs[snapFeed.docs.length - 1]);
+        setHasMoreFeed(snapFeed.docs.length >= PAGE_SIZE);
+      } else {
+        setHasMoreFeed(false);
+      }
     } catch (e) {
       console.error("Community data error:", e);
     }
@@ -99,6 +110,45 @@ export default function CommunityScreen() {
     setRefreshing(true);
     await loadData();
     setRefreshing(false);
+  };
+
+  const handleLoadMore = async () => {
+    if (activeTab !== 'feed' || !lastFeedDoc || !hasMoreFeed || loadingMore) return;
+    setLoadingMore(true);
+
+    try {
+      const qFeed = query(collection(db, 'CommunityPosts'), orderBy('timestamp', 'desc'), startAfter(lastFeedDoc), limit(PAGE_SIZE));
+      const snapFeed = await getDocs(qFeed);
+      const newPosts = [];
+      
+      for (const d of snapFeed.docs) {
+        const dat = d.data();
+        if (!dat.flaggedCount || dat.flaggedCount < 3) {
+          const authorDoc = await getDoc(doc(db, 'Users', dat.userId));
+          const authorData = authorDoc.exists() ? authorDoc.data() : {};
+          
+          newPosts.push({ 
+            id: d.id, 
+            ...dat, 
+            authorProfilePic: authorData.profilePic || null, 
+            authorScore: authorData.score || 0,
+            createdAt: dat.timestamp ? dat.timestamp.toDate() : new Date() 
+          });
+        }
+      }
+
+      setFeed(prev => [...prev, ...newPosts]);
+      if (snapFeed.docs.length > 0) {
+        setLastFeedDoc(snapFeed.docs[snapFeed.docs.length - 1]);
+        setHasMoreFeed(snapFeed.docs.length >= PAGE_SIZE);
+      } else {
+        setHasMoreFeed(false);
+      }
+    } catch (e) {
+      console.error("Pagination error:", e);
+    } finally {
+      setLoadingMore(false);
+    }
   };
 
   const handleSearch = (text) => {
@@ -212,11 +262,11 @@ export default function CommunityScreen() {
     setAwardModalVisible(false);
 
     Alert.alert(
-      "Confirm Gift", 
-      `This will deduct ${award.cost} points from your total score to send a ${award.name} award. Continue?`, 
+      "Confirm Gift Purchase", 
+      `Are you sure you want to spend ${award.cost} Eco Points to send a ${award.name} award?`, 
       [
         { text: "Cancel", style: "cancel" },
-        { text: "Send Gift", onPress: async () => {
+        { text: "Confirm Gift", onPress: async () => {
             try {
               await runTransaction(db, async (t) => {
                 const userRef = doc(db, "Users", user.uid);
@@ -252,14 +302,54 @@ export default function CommunityScreen() {
     return list.map((u, index) => ({ ...u, rank: index + 1 }));
   };
 
+  const currentUserId = auth.currentUser?.uid;
+  const leaderboardData = getLeaderboardData();
+  const currentUserRankObj = leaderboard.find(u => u.id === currentUserId);
+
   const displayData = activeTab === 'feed' 
     ? (feedFilter === 'global' ? feed : feed.filter(post => following.includes(post.userId)))
-    : getLeaderboardData();
+    : leaderboardData;
+
+  const renderLeaderboardHeader = () => {
+    if (activeTab !== 'leaderboard') return null;
+
+    return (
+      <View style={{ marginBottom: 10 }}>
+        <View style={styles.searchBar}>
+          <Ionicons name="search" size={18} color="#777" />
+          <TextInput style={styles.input} placeholder="Search members..." value={searchQuery} onChangeText={handleSearch} />
+        </View>
+
+        {currentUserRankObj && !searchQuery && (
+          <View style={styles.pinnedUserSection}>
+            <Text style={styles.pinnedHeaderTitle}>YOUR RANKING</Text>
+            <TouchableOpacity style={styles.pinnedCard} onPress={() => handleOpenUserProfile(currentUserRankObj.id)}>
+              <Text style={styles.pinnedRankNum}>#{currentUserRankObj.rank}</Text>
+              {currentUserRankObj.profilePic ? (
+                <Image source={{ uri: currentUserRankObj.profilePic }} style={styles.smallAvatar} />
+              ) : (
+                <View style={styles.smallAvatarPlaceholder}>
+                  <Text style={{ color: '#fff', fontSize: 10, fontWeight: 'bold' }}>{currentUserRankObj.displayName[0].toUpperCase()}</Text>
+                </View>
+              )}
+              <Text style={styles.pinnedName}>{currentUserRankObj.displayName} {getEcoEmoji(currentUserRankObj.score)}</Text>
+              <Text style={styles.pinnedScoreText}>{currentUserRankObj.score} pts</Text>
+              <View style={styles.youBadge}>
+                <Text style={styles.youBadgeText}>You</Text>
+              </View>
+            </TouchableOpacity>
+            <View style={styles.sectionDivider} />
+            <Text style={styles.pinnedHeaderTitle}>LEADERBOARD</Text>
+          </View>
+        )}
+      </View>
+    );
+  };
 
   return (
     <View style={styles.mainContainer}>
       
-      {/* USER PROFILE MODAL WITH RANK & COMPLETED QUESTS */}
+      {/* USER PROFILE MODAL */}
       <Modal visible={profileModalVisible} transparent={true} animationType="fade">
         <TouchableOpacity style={styles.modalOverlay} onPress={() => setProfileModalVisible(false)} activeOpacity={1}>
           <View style={styles.userPopupCard}>
@@ -325,7 +415,7 @@ export default function CommunityScreen() {
         </TouchableOpacity>
       </Modal>
 
-      {/* EXACT QUEST HUB HEADER MATCH */}
+      {/* HEADER */}
       <View style={styles.headerBackground}>
         <SafeAreaView edges={['top', 'left', 'right']}>
           <View style={styles.headerContent}>
@@ -359,19 +449,16 @@ export default function CommunityScreen() {
           </TouchableOpacity>
         </View>
 
-        {activeTab === 'leaderboard' && (
-          <View style={styles.searchBar}>
-            <Ionicons name="search" size={18} color="#777" />
-            <TextInput style={styles.input} placeholder="Search members..." value={searchQuery} onChangeText={handleSearch} />
-          </View>
-        )}
-
         {loading ? <ActivityIndicator size="large" color="#2D6A4F" style={{ marginTop: 40 }} /> : (
           <FlatList
             data={displayData}
             keyExtractor={item => item.id}
             refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />}
+            onEndReached={handleLoadMore}
+            onEndReachedThreshold={0.4}
             keyboardShouldPersistTaps="handled"
+            ListHeaderComponent={renderLeaderboardHeader}
+            ListFooterComponent={() => loadingMore ? <ActivityIndicator color="#2D6A4F" style={{ marginVertical: 15 }} /> : null}
             ListEmptyComponent={() => (
               <Text style={styles.emptyStateText}>
                 {feedFilter === 'following' 
@@ -574,6 +661,14 @@ const styles = StyleSheet.create({
 
   searchBar: { flexDirection: 'row', backgroundColor: '#fff', padding: 12, borderRadius: 12, alignItems: 'center', marginBottom: 15, shadowColor: '#000', shadowOpacity: 0.03, shadowRadius: 5, elevation: 1 },
   input: { marginLeft: 10, flex: 1, fontSize: 16, color: '#333' },
+
+  pinnedUserSection: { marginBottom: 10 },
+  pinnedHeaderTitle: { fontSize: 11, fontWeight: 'bold', color: '#2D6A4F', letterSpacing: 1, marginBottom: 8, marginLeft: 4 },
+  pinnedCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#2D6A4F', padding: 16, borderRadius: 16, shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 6, elevation: 3 },
+  pinnedRankNum: { fontWeight: '900', color: '#74C69D', width: 45, fontSize: 16 },
+  pinnedName: { flex: 1, fontSize: 16, fontWeight: '900', color: '#fff', marginLeft: 10 },
+  pinnedScoreText: { fontWeight: '900', color: '#D8F3DC', fontSize: 16 },
+  sectionDivider: { height: 1, backgroundColor: '#EBF4EE', marginVertical: 15 },
   
   leaderCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', padding: 16, borderRadius: 16, marginBottom: 10, shadowColor: '#000', shadowOpacity: 0.04, shadowRadius: 6, elevation: 2 },
   myLeaderCard: { backgroundColor: '#EBF4EE', borderColor: '#52B788', borderWidth: 1.5 },
@@ -592,7 +687,7 @@ const styles = StyleSheet.create({
   followBtnText: { color: '#2D6A4F', fontWeight: 'bold', fontSize: 12 },
   followingBtnText: { color: '#777' },
 
-  youBadge: { backgroundColor: '#2D6A4F', paddingVertical: 6, paddingHorizontal: 14, borderRadius: 15, marginLeft: 10 },
+  youBadge: { backgroundColor: '#52B788', paddingVertical: 6, paddingHorizontal: 14, borderRadius: 15, marginLeft: 10 },
   youBadgeText: { color: '#fff', fontWeight: 'bold', fontSize: 12 },
 
   postCard: { backgroundColor: '#fff', borderRadius: 20, marginBottom: 20, overflow: 'hidden', shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 4 },

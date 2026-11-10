@@ -7,6 +7,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { auth, db } from '../firebaseConfig';
 import { completeDailyQuest } from '../dailyQuestUtils';
+import { queueOfflinePost } from '../offlineSyncUtils';
 
 const { width } = Dimensions.get('window');
 const FRAME_SIZE = width - 30;
@@ -72,18 +73,22 @@ export default function CameraScreen({ navigation, route }) {
       return;
     }
 
+    const postPayload = {
+      userId: user.uid,
+      userDisplayName: user.email ? user.email.split('@')[0] : 'EcoActioner',
+      dareTitle: quest?.title || 'Daily Quest',
+      dareDescription: quest?.description || '',
+      userCaption: caption.trim(), 
+      dareDifficulty: quest?.difficulty || 'Medium',
+      imageURL: base64Image,
+      likes: 0,
+      pointsAwarded: quest?.points || 0
+    };
+
     try {
       await addDoc(collection(db, 'CommunityPosts'), {
-        userId: user.uid,
-        userDisplayName: user.email ? user.email.split('@')[0] : 'EcoActioner',
-        dareTitle: quest?.title || 'Daily Quest',
-        dareDescription: quest?.description || '',
-        userCaption: caption.trim(), 
-        dareDifficulty: quest?.difficulty || 'Medium',
-        imageURL: base64Image,
-        timestamp: serverTimestamp(),
-        likes: 0,
-        pointsAwarded: quest?.points || 0
+        ...postPayload,
+        timestamp: serverTimestamp()
       });
 
       if (quest) {
@@ -92,8 +97,9 @@ export default function CameraScreen({ navigation, route }) {
       Alert.alert("Success!", "Action shared to the community.");
       navigation.popToTop();
     } catch (e) {
-      console.error(e);
-      Alert.alert("Upload Error", "Failed to upload verification.");
+      await queueOfflinePost(postPayload, quest ? { questId: quest.questId, points: quest.points } : null);
+      Alert.alert("Saved Offline", "Network error. Your photo post has been saved locally and will sync when reconnected.");
+      navigation.popToTop();
     } finally {
       setUploading(false);
     }

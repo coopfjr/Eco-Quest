@@ -11,7 +11,7 @@ export default function LoadingScreen() {
         <View style={styles.iconContainer}>
           <Ionicons name="leaf" size={70} color="#fff" />
         </View>
-        <Text style={styles.title}> APP NAME </Text>
+        <Text style={styles.title}>ECO QUEST</Text>
         <Text style={styles.subtitle}>Micro-Actions for Macro Impact</Text>
         <ActivityIndicator size="large" color="#fff" style={styles.spinner} />
       </View>
