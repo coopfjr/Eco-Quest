@@ -34,5 +34,8 @@
     "ios": "expo start --ios",
     "web": "expo start --web"
   },
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "firebase-admin": "^14.5.0"
+  }
 }
