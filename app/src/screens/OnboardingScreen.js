@@ -160,7 +160,7 @@ export default function OnboardingScreen() {
             <View style={{ marginTop: 22 }}>
               <Field label="Public handle" hint={`${HANDLE_RULES} Must be unique.`}>
                 <TextInput style={inputStyle} value={displayName} onChangeText={setDisplayName} maxLength={20} autoCapitalize="none"
-                  placeholder="e.g. cooper" placeholderTextColor={colors.muted} accessibilityLabel="Public handle" returnKeyType="done" />
+                 accessibilityLabel="Public handle" returnKeyType="done" />
               </Field>
             </View>
           </View>

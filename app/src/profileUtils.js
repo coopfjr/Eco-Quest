@@ -23,7 +23,7 @@ export const validateHandle = (raw) => {
   return { ok: true, handle, lower: handle.toLowerCase() };
 };
 
-// Case-insensitive check, so "Cooper" and "cooper" can't both exist. Also checks the
+// Case-insensitive check, so "C" and "c" can't both exist. Also checks the
 // exact-case field for accounts created before userDisplayNameLower existed.
 export const isHandleTaken = async (handle, myUid) => {
   const lower = handle.toLowerCase();
