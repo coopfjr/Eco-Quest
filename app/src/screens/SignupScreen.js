@@ -1,30 +1,29 @@
 // src/screens/SignupScreen.js
 import React, { useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ScrollView, ActivityIndicator, KeyboardAvoidingView, Platform } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
+import { View, Text, TextInput, Alert, ScrollView, KeyboardAvoidingView, Platform } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { createUserWithEmailAndPassword } from 'firebase/auth';
 import { doc, setDoc } from 'firebase/firestore';
 import { auth, db } from '../firebaseConfig';
 import { assignDailyQuests } from '../dailyQuestUtils';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Drop } from '../ui/Critters';
+import { Button, Field, IconButton, TextLink, inputStyle } from '../ui/components';
+import { colors, type } from '../ui/theme';
 
 export default function SignupScreen({ navigation }) {
+  const insets = useSafeAreaInsets();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
-  const insets = useSafeAreaInsets();
 
   const handleSignup = async () => {
     if (!email || !password) {
-      Alert.alert("Error", "Please fill in all fields.");
+      Alert.alert('Missing info', 'Please fill in both fields.');
       return;
     }
-    
     setLoading(true);
     try {
-      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-      const user = userCredential.user;
-      
+      const { user } = await createUserWithEmailAndPassword(auth, email.trim(), password);
       await setDoc(doc(db, 'Users', user.uid), {
         email: user.email,
         score: 0,
@@ -34,87 +33,43 @@ export default function SignupScreen({ navigation }) {
         dailyQuests: [],
         onboardingComplete: false,
       });
-      
       await assignDailyQuests();
     } catch (error) {
-      Alert.alert("Signup Failed", error.message);
+      Alert.alert('Sign up failed', error.message);
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.container}>
-      
-      <TouchableOpacity 
-        style={[styles.backButton, { top: Math.max(insets.top + 10, 40) }]} 
-        onPress={() => navigation.navigate('Login')}
-      >
-        <Ionicons name="arrow-back" size={28} color="#fff" />
-      </TouchableOpacity>
-
-      <ScrollView contentContainerStyle={styles.scrollContainer} keyboardShouldPersistTaps="handled">
-        <View style={styles.headerContainer}>
-          <Text style={styles.appTitle}>Join the Community</Text>
-          <Text style={styles.tagline}>Start your daily climate micro-actions.</Text>
+    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1, backgroundColor: colors.ground }}>
+      <ScrollView contentContainerStyle={{ flexGrow: 1, paddingBottom: insets.bottom + 24 }} keyboardShouldPersistTaps="handled">
+        <View style={{ backgroundColor: colors.pistachio, borderBottomLeftRadius: 44, borderBottomRightRadius: 44, paddingTop: insets.top + 40, paddingHorizontal: 24, paddingBottom: 28, minHeight: 300, justifyContent: 'flex-end' }}>
+          <IconButton name="back" label="Back to log in" onPress={() => navigation.navigate('Login')} style={{ position: 'absolute', left: 14, top: insets.top + 8 }} />
+          <View style={{ position: 'absolute', right: 22, top: insets.top + 40 }}><Drop size={116} /></View>
+          <Text style={[type.eyebrow, { fontSize: 14, marginBottom: 6 }]}>START SMALL</Text>
+          <Text style={type.hero} accessibilityRole="header">JOIN{'\n'}THE QUEST</Text>
         </View>
 
-        <View style={styles.card}>
-          <View style={styles.inputContainer}>
-            <Ionicons name="mail-outline" size={20} color="#666" style={styles.inputIcon} />
-            <TextInput 
-              style={styles.input} 
-              placeholder="Email Address"
-              value={email} 
-              onChangeText={setEmail} 
-              keyboardType="email-address"
-              autoCapitalize="none" 
-              placeholderTextColor="#999" 
-            />
-          </View>
-
-          <View style={styles.inputContainer}>
-            <Ionicons name="lock-closed-outline" size={20} color="#666" style={styles.inputIcon} />
-            <TextInput 
-              style={styles.input} 
-              placeholder="Password"
-              value={password} 
-              onChangeText={setPassword} 
-              secureTextEntry
-              placeholderTextColor="#999" 
-            />
-          </View>
-
-          <TouchableOpacity style={styles.signupButton} onPress={handleSignup} disabled={loading}>
-            {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Create Account</Text>}
-          </TouchableOpacity>
+        <View style={{ padding: 24, gap: 16 }}>
+          <Field label="Email">
+            <TextInput style={inputStyle} value={email} onChangeText={setEmail} placeholder="you@school.ca" placeholderTextColor={colors.muted}
+              keyboardType="email-address" autoCapitalize="none" autoComplete="email" textContentType="emailAddress" accessibilityLabel="Email" />
+          </Field>
+          <Field label="Password">
+            <TextInput style={inputStyle} value={password} onChangeText={setPassword} placeholder="At least 6 characters" placeholderTextColor={colors.muted}
+              secureTextEntry autoComplete="password-new" textContentType="newPassword" accessibilityLabel="Password" />
+          </Field>
+          <Text style={type.small}>Your email stays private. You'll pick a public handle in the next step.</Text>
+          <Button label="Create account" onPress={handleSignup} loading={loading} style={{ marginTop: 4 }} />
         </View>
 
-        <View style={styles.footer}>
-          <Text style={styles.footerText}>Already registered?</Text>
-          <TouchableOpacity onPress={() => navigation.navigate('Login')}>
-            <Text style={styles.loginText}>Log In</Text>
-          </TouchableOpacity>
+        <View style={{ flex: 1 }} />
+        <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center' }}>
+          <Text style={type.bodyMuted}>Already have one? </Text>
+          <TextLink label="Log in" onPress={() => navigation.navigate('Login')} textStyle={{ fontSize: 15 }} />
         </View>
       </ScrollView>
     </KeyboardAvoidingView>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#2D6A4F' },
-  backButton: { position: 'absolute', left: 20, zIndex: 10, padding: 10 },
-  scrollContainer: { flexGrow: 1, justifyContent: 'center', padding: 20 },
-  headerContainer: { alignItems: 'center', marginBottom: 25 },
-  appTitle: { fontSize: 28, fontWeight: 'bold', color: '#fff' },
-  tagline: { fontSize: 15, color: 'rgba(255,255,255,0.85)', marginTop: 5 },
-  card: { backgroundColor: '#fff', borderRadius: 20, padding: 25, elevation: 6 },
-  inputContainer: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#eee', backgroundColor: '#f9f9f9', borderRadius: 12, paddingHorizontal: 15, marginBottom: 15, height: 50 },
-  inputIcon: { marginRight: 10 },
-  input: { flex: 1, height: '100%', color: '#333', fontSize: 16 },
-  signupButton: { backgroundColor: '#52B788', borderRadius: 12, height: 50, justifyContent: 'center', alignItems: 'center', marginTop: 10 },
-  buttonText: { color: '#fff', fontWeight: 'bold', fontSize: 17 },
-  footer: { flexDirection: 'row', justifyContent: 'center', marginTop: 25 },
-  footerText: { color: 'rgba(255,255,255,0.85)', fontSize: 15 },
-  loginText: { color: '#fff', fontWeight: 'bold', fontSize: 15, marginLeft: 6, textDecorationLine: 'underline' },
-});

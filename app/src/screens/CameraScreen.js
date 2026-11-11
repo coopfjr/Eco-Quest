@@ -1,207 +1,182 @@
 // src/screens/CameraScreen.js
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Image, Alert, ActivityIndicator, SafeAreaView, Dimensions, TextInput, KeyboardAvoidingView, Platform, TouchableWithoutFeedback, Keyboard } from 'react-native';
+import { View, Text, TouchableOpacity, Image, Alert, ActivityIndicator, TextInput, KeyboardAvoidingView, Platform, ScrollView } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
-import { Ionicons } from '@expo/vector-icons';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { auth, db } from '../firebaseConfig';
 import { completeDailyQuest } from '../dailyQuestUtils';
 import { queueOfflinePost } from '../offlineSyncUtils';
+import { getPublicName } from '../profileUtils';
+import { prepareImageForUpload } from '../imageUtils';
+import { getScore } from './QuestDetailScreen';
+import { DIFFICULTY_CRITTER } from '../ui/Critters';
+import Icon from '../ui/Icons';
+import { Button, IconButton, Notice, Field, inputStyle } from '../ui/components';
+import { colors, difficultyTheme, fonts, type } from '../ui/theme';
 
-const { width } = Dimensions.get('window');
-const FRAME_SIZE = width - 30;
+const CAPTION_MAX = 120;
+const DARK = '#16211B';
 
 export default function CameraScreen({ navigation, route }) {
-  const { quest } = route.params || {};
+  const insets = useSafeAreaInsets();
+  const { quest, caption: initialCaption } = route.params || {};
   const [permission, requestPermission] = useCameraPermissions();
   const [photo, setPhoto] = useState(null);
   const [base64Image, setBase64Image] = useState(null);
-  const [caption, setCaption] = useState('');
+  const [caption, setCaption] = useState(initialCaption || '');
+  const [processing, setProcessing] = useState(false);
   const [uploading, setUploading] = useState(false);
   const cameraRef = useRef(null);
+  const Critter = DIFFICULTY_CRITTER[quest?.difficulty] || DIFFICULTY_CRITTER.Medium;
 
   useEffect(() => {
-    (async () => {
-      if (!permission?.granted) await requestPermission();
-    })();
+    if (!permission?.granted) requestPermission();
   }, []);
 
+  // Re-encode every image before preview/upload: drops EXIF/GPS metadata and shrinks size.
+  const applyImage = async (uri, width) => {
+    setProcessing(true);
+    try {
+      const prepared = await prepareImageForUpload(uri, width);
+      setPhoto(prepared.uri);
+      setBase64Image(prepared.base64);
+    } catch (e) {
+      Alert.alert('Error', 'Could not process the photo.');
+    } finally {
+      setProcessing(false);
+    }
+  };
+
   const takePicture = async () => {
-    if (cameraRef.current) {
-      try {
-        const photoData = await cameraRef.current.takePictureAsync({
-          quality: 0.3,
-          base64: true,
-          skipProcessing: true
-        });
-        setPhoto(photoData.uri);
-        setBase64Image(`data:image/jpeg;base64,${photoData.base64}`);
-      } catch (err) {
-        Alert.alert("Error", "Could not capture frame.");
-      }
+    if (!cameraRef.current || processing) return;
+    try {
+      const shot = await cameraRef.current.takePictureAsync({ quality: 0.7, exif: false });
+      await applyImage(shot.uri, shot.width);
+    } catch (e) {
+      Alert.alert('Error', 'Could not take the photo.');
     }
   };
 
   const pickFromGallery = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
-      Alert.alert('Permission Denied', 'Gallery access is required to upload photos.');
+      Alert.alert('Permission needed', 'Photo library access is needed to upload a photo.');
       return;
     }
-    
-    let result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      quality: 0.3,
-      base64: true,
-    });
-
-    if (!result.canceled && result.assets && result.assets.length > 0) {
-      setPhoto(result.assets[0].uri);
-      setBase64Image(`data:image/jpeg;base64,${result.assets[0].base64}`);
-    }
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, allowsEditing: true, quality: 0.7, exif: false });
+    if (!result.canceled && result.assets?.length) await applyImage(result.assets[0].uri, result.assets[0].width);
   };
 
   const handlePost = async () => {
-    if (!base64Image) return;
-    setUploading(true);
+    if (!base64Image || uploading) return;
     const user = auth.currentUser;
-    if (!user) {
-      Alert.alert("Error", "User not logged in.");
-      setUploading(false);
-      return;
-    }
-
+    if (!user) return;
+    setUploading(true);
+    const prevScore = await getScore(user.uid);
     const postPayload = {
       userId: user.uid,
-      userDisplayName: user.email ? user.email.split('@')[0] : 'EcoActioner',
+      userDisplayName: await getPublicName(user.uid),
       dareTitle: quest?.title || 'Daily Quest',
       dareDescription: quest?.description || '',
-      userCaption: caption.trim(), 
+      userCaption: caption.trim(),
       dareDifficulty: quest?.difficulty || 'Medium',
       imageURL: base64Image,
       likes: 0,
-      pointsAwarded: quest?.points || 0
+      pointsAwarded: quest?.points || 0,
     };
-
     try {
-      await addDoc(collection(db, 'CommunityPosts'), {
-        ...postPayload,
-        timestamp: serverTimestamp()
-      });
-
-      if (quest) {
-        await completeDailyQuest(quest.questId, quest.points);
-      }
-      Alert.alert("Success!", "Action shared to the community.");
-      navigation.popToTop();
+      await addDoc(collection(db, 'CommunityPosts'), { ...postPayload, timestamp: serverTimestamp() });
+      if (quest) await completeDailyQuest(quest.questId, quest.points);
+      navigation.replace('Done', { quest, prevScore, shared: true, offline: false });
     } catch (e) {
       await queueOfflinePost(postPayload, quest ? { questId: quest.questId, points: quest.points } : null);
-      Alert.alert("Saved Offline", "Network error. Your photo post has been saved locally and will sync when reconnected.");
-      navigation.popToTop();
+      navigation.replace('Done', { quest, prevScore, shared: true, offline: true });
     } finally {
       setUploading(false);
     }
   };
 
-  if (!permission?.granted) {
+  // ---- Preview + caption step (light) ----
+  if (photo) {
     return (
-      <View style={styles.container}>
-        <Text style={{ color: '#fff', marginTop: 80 }}>Camera access is required.</Text>
-        <TouchableOpacity style={styles.permButton} onPress={requestPermission}>
-          <Text style={{ color: '#fff', fontWeight: 'bold' }}>Grant Permissions</Text>
-        </TouchableOpacity>
-      </View>
+      <KeyboardAvoidingView style={{ flex: 1, backgroundColor: colors.ground }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <ScrollView contentContainerStyle={{ paddingTop: insets.top + 8, paddingHorizontal: 20, paddingBottom: insets.bottom + 24, gap: 14 }} keyboardShouldPersistTaps="handled">
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+            <IconButton name="back" label="Retake photo" onPress={() => { setPhoto(null); setBase64Image(null); }} />
+            <Text style={type.h2} accessibilityRole="header">Add a caption</Text>
+            <View style={{ width: 48 }} />
+          </View>
+          <Image source={{ uri: photo }} style={{ width: '100%', aspectRatio: 1, borderRadius: 28, backgroundColor: colors.sage }} accessibilityLabel="Your photo" />
+          <Field label="Caption" optional>
+            <TextInput
+              style={[inputStyle, { minHeight: 80, paddingTop: 12, textAlignVertical: 'top' }]}
+              value={caption}
+              onChangeText={setCaption}
+              placeholder="How did it go?"
+              placeholderTextColor={colors.muted}
+              maxLength={CAPTION_MAX}
+              multiline
+              accessibilityLabel="Optional caption for your post"
+            />
+            <Text style={[type.small, { textAlign: 'right' }]}>{caption.length}/{CAPTION_MAX}</Text>
+          </Field>
+          <Notice icon="lock">Shared publicly to the community feed. Location data has been removed.</Notice>
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 6 }}>
+            <Button label="Retake" variant="outline" onPress={() => { setPhoto(null); setBase64Image(null); }} disabled={uploading} style={{ flex: 1, paddingHorizontal: 10 }} />
+            <Button label="Share & complete" iconRight="arrow" onPress={handlePost} loading={uploading} style={{ flex: 2, paddingHorizontal: 12 }} />
+          </View>
+        </ScrollView>
+      </KeyboardAvoidingView>
     );
   }
 
+  // ---- Capture step (dark) ----
   return (
-    <SafeAreaView style={styles.container}>
-      <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={40} style={{ flex: 1, width: '100%', alignItems: 'center' }}>
-          
-          <View style={styles.headerArea}>
-            <Text style={styles.headerText}>{photo ? "Add a Caption" : "Capture Action"}</Text>
+    <View style={{ flex: 1, backgroundColor: DARK, paddingTop: insets.top + 8, paddingHorizontal: 20, paddingBottom: insets.bottom + 24 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+        <IconButton name="close" label="Close camera" onPress={() => navigation.goBack()} bg="rgba(255,255,255,0.14)" color={colors.white} />
+        {quest && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: (difficultyTheme[quest.difficulty] || difficultyTheme.Medium).bg, borderRadius: 20, paddingVertical: 4, paddingLeft: 6, paddingRight: 14 }}>
+            <Critter size={28} />
+            <Text style={type.label} numberOfLines={1}>{quest.title}</Text>
           </View>
+        )}
+        <View style={{ width: 48 }} />
+      </View>
 
-          <View style={styles.cameraFrame}>
-            {photo ? (
-              <Image source={{ uri: photo }} style={styles.cameraView} resizeMode="cover" />
-            ) : (
-              <CameraView style={styles.cameraView} ref={cameraRef} facing="back" />
-            )}
+      <View style={{ flex: 1, marginTop: 20, marginBottom: 24, borderRadius: 32, overflow: 'hidden', backgroundColor: '#2C3B33', justifyContent: 'center', alignItems: 'center' }}>
+        {permission?.granted ? (
+          <CameraView style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }} ref={cameraRef} facing="back" />
+        ) : (
+          <View style={{ alignItems: 'center', gap: 12, padding: 24 }}>
+            <Text style={{ fontFamily: fonts.body, color: '#C9D3CC', fontSize: 15, textAlign: 'center' }}>Camera access is needed to take a photo. You can still upload one from your library.</Text>
+            <Button label="Allow camera" variant="outline" onPress={requestPermission} />
           </View>
+        )}
+        {processing && <ActivityIndicator size="large" color={colors.white} />}
+        <View style={{ position: 'absolute', left: 16, right: 16, bottom: 16, backgroundColor: 'rgba(27,38,32,0.85)', borderRadius: 18, padding: 12, flexDirection: 'row', gap: 10 }}>
+          <Icon name="lock" size={18} color={colors.mint} />
+          <Text style={{ flex: 1, fontFamily: fonts.body, fontSize: 13, lineHeight: 18, color: colors.white }}>
+            Posts are public. Avoid faces, house numbers and licence plates. Location data is removed from photos.
+          </Text>
+        </View>
+      </View>
 
-          {photo && (
-            <View style={styles.captionContainer}>
-              <TextInput
-                style={styles.captionInput}
-                placeholder="Tell the community about it... (Optional)"
-                placeholderTextColor="#888"
-                value={caption}
-                onChangeText={setCaption}
-                maxLength={120}
-                multiline
-                returnKeyType="done"
-                onSubmitEditing={Keyboard.dismiss}
-              />
-            </View>
-          )}
-
-          <View style={styles.controlsArea}>
-            {photo ? (
-              uploading ? (
-                <ActivityIndicator size="large" color="#52B788" />
-              ) : (
-                <View style={styles.previewButtons}>
-                  <TouchableOpacity style={styles.retakeButton} onPress={() => { setPhoto(null); setBase64Image(null); setCaption(''); }}>
-                    <Ionicons name="close-circle-outline" size={28} color="#ccc" />
-                    <Text style={{ color: '#ccc', fontSize: 14, marginTop: 4 }}>Retake</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={styles.postButton} onPress={handlePost}>
-                    <Text style={styles.buttonText}>Share to Community</Text>
-                    <Ionicons name="send" size={18} color="#fff" style={{ marginLeft: 8 }} />
-                  </TouchableOpacity>
-                </View>
-              )
-            ) : (
-              <View style={styles.captureRow}>
-                <TouchableOpacity style={styles.galleryButton} onPress={pickFromGallery}>
-                  <Ionicons name="images" size={30} color="#fff" />
-                  <Text style={{ color: '#fff', fontSize: 10, marginTop: 4 }}>Upload</Text>
-                </TouchableOpacity>
-                
-                <TouchableOpacity style={styles.captureButton} onPress={takePicture}>
-                  <View style={styles.innerCapture} />
-                </TouchableOpacity>
-
-                <View style={{ width: 60 }} /> 
-              </View>
-            )}
-          </View>
-        </KeyboardAvoidingView>
-      </TouchableWithoutFeedback>
-    </SafeAreaView>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12 }}>
+        <IconButton name="image" label="Upload from your photos" onPress={pickFromGallery} bg="rgba(255,255,255,0.14)" color={colors.white} size={60} iconSize={26} />
+        <TouchableOpacity
+          onPress={takePicture}
+          disabled={!permission?.granted || processing}
+          accessibilityRole="button"
+          accessibilityLabel="Take photo"
+          style={{ width: 86, height: 86, borderRadius: 43, borderWidth: 5, borderColor: colors.mint, alignItems: 'center', justifyContent: 'center', opacity: permission?.granted ? 1 : 0.4 }}
+        >
+          <View style={{ width: 66, height: 66, borderRadius: 33, backgroundColor: colors.white }} />
+        </TouchableOpacity>
+        <View style={{ width: 60 }} />
+      </View>
+    </View>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000', alignItems: 'center' },
-  headerArea: { height: 70, justifyContent: 'center', alignItems: 'center' },
-  headerText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
-  cameraFrame: { width: FRAME_SIZE, height: FRAME_SIZE, borderRadius: 20, overflow: 'hidden', backgroundColor: '#111' },
-  cameraView: { flex: 1, width: '100%', height: '100%' },
-  captionContainer: { width: FRAME_SIZE, marginTop: 20, backgroundColor: '#222', borderRadius: 12, padding: 10 },
-  captionInput: { color: '#fff', fontSize: 15, minHeight: 40 },
-  controlsArea: { flex: 1, justifyContent: 'center', alignItems: 'center', width: '100%' },
-  captureRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', width: FRAME_SIZE, paddingHorizontal: 20 },
-  galleryButton: { alignItems: 'center', width: 60 },
-  captureButton: { width: 75, height: 75, borderRadius: 40, backgroundColor: 'rgba(255, 255, 255,0.3)', justifyContent: 'center', alignItems: 'center' },
-  innerCapture: { width: 58, height: 58, borderRadius: 30, backgroundColor: '#fff' },
-  previewButtons: { flexDirection: 'row', width: '100%', paddingHorizontal: 30, justifyContent: 'space-between', alignItems: 'center' },
-  retakeButton: { alignItems: 'center', padding: 10 },
-  postButton: { flexDirection: 'row', backgroundColor: '#2D6A4F', paddingVertical: 16, paddingHorizontal: 24, borderRadius: 30, alignItems: 'center', elevation: 5 },
-  buttonText: { color: 'white', fontSize: 16, fontWeight: 'bold' },
-  permButton: { marginTop: 20, backgroundColor: '#2D6A4F', padding: 12, borderRadius: 8 },
-});

@@ -6,6 +6,7 @@ import { completeDailyQuest } from './dailyQuestUtils';
 
 const QUEUE_KEY = '@ecoquest_offline_posts_queue';
 
+// postData can be null when the user completed a quest without sharing it to the feed.
 export const queueOfflinePost = async (postData, questInfo) => {
   try {
     const existing = await AsyncStorage.getItem(QUEUE_KEY);
@@ -14,12 +15,16 @@ export const queueOfflinePost = async (postData, questInfo) => {
     await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
     return true;
   } catch (e) {
-    console.error("Failed to queue offline post:", e);
+    console.error('Failed to queue offline post:', e);
     return false;
   }
 };
 
+let syncing = false;
+
 export const syncOfflinePosts = async () => {
+  if (syncing) return;
+  syncing = true;
   try {
     const existing = await AsyncStorage.getItem(QUEUE_KEY);
     if (!existing) return;
@@ -30,10 +35,12 @@ export const syncOfflinePosts = async () => {
     for (const item of queue) {
       try {
         const { postData, questInfo } = item;
-        await addDoc(collection(db, 'CommunityPosts'), {
-          ...postData,
-          timestamp: serverTimestamp()
-        });
+        if (postData) {
+          await addDoc(collection(db, 'CommunityPosts'), {
+            ...postData,
+            timestamp: serverTimestamp(),
+          });
+        }
         if (questInfo) {
           await completeDailyQuest(questInfo.questId, questInfo.points);
         }
@@ -43,6 +50,8 @@ export const syncOfflinePosts = async () => {
     }
     await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(remainingQueue));
   } catch (e) {
-    console.error("Failed syncing offline posts:", e);
+    console.error('Failed syncing offline posts:', e);
+  } finally {
+    syncing = false;
   }
 };

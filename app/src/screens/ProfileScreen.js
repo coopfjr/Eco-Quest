@@ -1,282 +1,195 @@
 // src/screens/ProfileScreen.js
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Alert, ActivityIndicator, Image, ScrollView, Modal } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { auth, db } from '../firebaseConfig';
+import { View, Text, TouchableOpacity, Alert, ActivityIndicator, ScrollView } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { doc, onSnapshot, updateDoc } from 'firebase/firestore';
 import { signOut } from 'firebase/auth';
-import { Ionicons } from '@expo/vector-icons';
-import * as ImagePicker from 'expo-image-picker';
-
-const CLIMATE_TAGS = ["Energy", "Mobility", "Food", "Digital", "Home", "Consumption", "Fitness"];
-
-const ECO_TIERS = [
-  { score: 1000, title: "Global Guardian", emoji: "🌍" },
-  { score: 500, title: "Forest Ranger", emoji: "🌳" },
-  { score: 200, title: "River Keeper", emoji: "💧" },
-  { score: 50, title: "Sprout", emoji: "🌱" },
-  { score: 0, title: "Seedling", emoji: "🌰" },
-];
+import { auth, db } from '../firebaseConfig';
+import { ECO_TIERS, getTier, getNextTier, getTierProgress } from '../ecoTiers';
+import { CLIMATE_TAGS } from './OnboardingScreen';
+import { AVATARS, Avatar } from '../ui/Critters';
+import { TierBadge } from '../ui/Badges';
+import Icon from '../ui/Icons';
+import { Button, Chip, ProgressBar, Sheet } from '../ui/components';
+import { TAB_BAR_SPACE } from '../ui/TabBar';
+import { colors, fonts, type } from '../ui/theme';
 
 export default function ProfileScreen() {
+  const insets = useSafeAreaInsets();
   const [userData, setUserData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [uploadingPic, setUploadingPic] = useState(false);
-  const [selectedInterests, setSelectedInterests] = useState([]);
+  const [selectedInterests, setSelectedInterests] = useState(null);
   const [savingPrefs, setSavingPrefs] = useState(false);
-  const [titleModalVisible, setTitleModalVisible] = useState(false);
-  
-  const userEmail = auth.currentUser?.email;
-  const displayName = userData?.userDisplayName || (userEmail ? userEmail.split('@')[0] : 'User');
-  const currentScore = userData?.score || 0;
-
-  const getEcoTitle = (score) => {
-    if (score >= 1000) return "Global Guardian 🌍";
-    if (score >= 500) return "Forest Ranger 🌳";
-    if (score >= 200) return "River Keeper 💧";
-    if (score >= 50) return "Sprout 🌱";
-    return "Seedling 🌰";
-  };
+  const [titlesOpen, setTitlesOpen] = useState(false);
+  const [avatarOpen, setAvatarOpen] = useState(false);
 
   useEffect(() => {
     const user = auth.currentUser;
     if (!user) { setLoading(false); return; }
-    
-    const unsubscribe = onSnapshot(doc(db, 'Users', user.uid), (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
+    return onSnapshot(doc(db, 'Users', user.uid), (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
         setUserData(data);
-        if (selectedInterests.length === 0 && data.interests) {
-          setSelectedInterests(data.interests);
-        }
+        setSelectedInterests(prev => prev === null ? (data.interests || []) : prev);
       }
       setLoading(false);
     });
-    return () => unsubscribe();
   }, []);
 
-  const handleLogout = async () => {
-    try { await signOut(auth); } catch (e) { Alert.alert("Error", "Logout failed."); }
-  };
+  if (loading) return <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}><ActivityIndicator size="large" color={colors.ink} /></View>;
 
-  const pickProfilePic = async () => {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission Denied', 'Gallery access is required to change profile picture.');
-      return;
-    }
-    
-    let result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.3,
-      base64: true,
-    });
+  const uid = auth.currentUser?.uid;
+  const score = userData?.score || 0;
+  const tier = getTier(score);
+  const nextTier = getNextTier(score);
+  const interests = selectedInterests || [];
+  const prefsChanged = JSON.stringify([...interests].sort()) !== JSON.stringify([...(userData?.interests || [])].sort());
 
-    if (!result.canceled && result.assets && result.assets.length > 0) {
-      setUploadingPic(true);
-      try {
-        const base64Img = `data:image/jpeg;base64,${result.assets[0].base64}`;
-        const user = auth.currentUser;
-        await updateDoc(doc(db, 'Users', user.uid), { profilePic: base64Img });
-      } catch (e) {
-        Alert.alert("Error", "Could not upload picture.");
-      } finally {
-        setUploadingPic(false);
-      }
-    }
-  };
-
-  const toggleTag = (tag) => {
-    if (selectedInterests.includes(tag)) setSelectedInterests(selectedInterests.filter(t => t !== tag));
-    else setSelectedInterests([...selectedInterests, tag]);
-  };
+  const toggleTag = (tag) => setSelectedInterests(prev => (prev || []).includes(tag) ? prev.filter(t => t !== tag) : [...(prev || []), tag]);
 
   const savePreferences = async () => {
     setSavingPrefs(true);
     try {
-      const user = auth.currentUser;
-      await updateDoc(doc(db, 'Users', user.uid), { interests: selectedInterests });
-      Alert.alert("Saved", "Your action domains have been updated.");
+      await updateDoc(doc(db, 'Users', uid), { interests });
+      Alert.alert('Saved', 'Your quests will lean towards these areas from tomorrow.');
     } catch (e) {
-      Alert.alert("Error", "Could not update preferences.");
+      Alert.alert('Error', 'Could not save your changes.');
     } finally {
       setSavingPrefs(false);
     }
   };
 
-  if (loading) return <View style={styles.center}><ActivityIndicator size="large" color="#2D6A4F" /></View>;
+  const chooseAvatar = async (key) => {
+    try {
+      await updateDoc(doc(db, 'Users', uid), { avatar: key });
+      setAvatarOpen(false);
+    } catch (e) {
+      Alert.alert('Error', 'Could not update your critter.');
+    }
+  };
+
+  const logout = () => {
+    Alert.alert('Log out?', 'You can log back in any time.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Log out', style: 'destructive', onPress: () => signOut(auth).catch(() => Alert.alert('Error', 'Log out failed.')) },
+    ]);
+  };
 
   return (
-    <View style={styles.mainContainer}>
-      
-      <Modal visible={titleModalVisible} transparent={true} animationType="fade">
-        <TouchableOpacity style={styles.modalOverlay} onPress={() => setTitleModalVisible(false)} activeOpacity={1}>
-          <View style={styles.rankMenu}>
-            <Text style={styles.rankMenuTitle}>Eco-Titles</Text>
-            <Text style={styles.rankMenuSub}>Earn points by completing quests to unlock new community status ranks.</Text>
-            
-            {ECO_TIERS.map((tier, index) => {
-              const isUnlocked = currentScore >= tier.score;
-              return (
-                <View key={index} style={[styles.tierRow, isUnlocked && styles.tierRowUnlocked]}>
-                  <Text style={styles.tierEmoji}>{tier.emoji}</Text>
-                  <View style={{ flex: 1 }}>
-                    <Text style={[styles.tierTitle, isUnlocked && styles.tierTitleUnlocked]}>{tier.title}</Text>
-                    <Text style={styles.tierScore}>{tier.score} pts required</Text>
-                  </View>
-                  {isUnlocked && <Ionicons name="checkmark-circle" size={24} color="#52B788" />}
-                </View>
-              );
-            })}
-          </View>
-        </TouchableOpacity>
-      </Modal>
-
-
-      <View style={styles.headerBackground}>
-        <SafeAreaView edges={['top', 'left', 'right']}>
-          <View style={styles.headerContent}>
-            <View>
-              <Text style={styles.greetingText}>Your Journey</Text>
-              <Text style={styles.headerTitle}>Player Profile</Text>
-            </View>
-            <View style={{ width: 75, height: 32 }} />
-          </View>
-        </SafeAreaView>
-      </View>
-
-      <ScrollView style={styles.scrollContainer} contentContainerStyle={{ paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
-        <View style={styles.cardContainer}>
-          <View style={styles.profileCard}>
-            <TouchableOpacity style={styles.avatarWrapper} onPress={pickProfilePic} disabled={uploadingPic}>
-              {uploadingPic ? (
-                 <View style={[styles.avatarCircle, { backgroundColor: '#EBF4EE' }]}>
-                   <ActivityIndicator color="#2D6A4F" />
-                 </View>
-              ) : userData?.profilePic ? (
-                 <Image source={{ uri: userData.profilePic }} style={styles.avatarImage} />
-              ) : (
-                 <View style={styles.avatarCircle}>
-                   <Text style={styles.avatarText}>{displayName[0].toUpperCase()}</Text>
-                 </View>
-              )}
-              <View style={styles.editIconBadge}>
-                <Ionicons name="camera" size={12} color="#fff" />
-              </View>
-            </TouchableOpacity>
-            
-            <Text style={styles.nameText}>{displayName}</Text>
-            
-            <TouchableOpacity style={styles.titlePill} onPress={() => setTitleModalVisible(true)}>
-              <Text style={styles.titlePillText}>{getEcoTitle(currentScore)}</Text>
-              <Ionicons name="chevron-down" size={14} color="#2D6A4F" style={{ marginLeft: 4 }} />
-            </TouchableOpacity>
-            
-            <Text style={styles.emailText}>{userEmail}</Text>
-          </View>
-
-          <View style={styles.statsContainer}>
-            <View style={styles.statBox}>
-              <Ionicons name="leaf" size={24} color="#2D6A4F" />
-              <Text style={styles.statNum}>{currentScore}</Text>
-              <Text style={styles.statLabel}>Eco Points</Text>
-            </View>
-            <View style={styles.statBox}>
-              <Ionicons name="checkmark-done-circle" size={24} color="#52B788" />
-              <Text style={styles.statNum}>{userData?.questsCompletedCount || 0}</Text>
-              <Text style={styles.statLabel}>Completed</Text>
-            </View>
-            <View style={styles.statBox}>
-              <Ionicons name="dice" size={24} color="#E9C46A" />
-              <Text style={styles.statNum}>{userData?.rerollTokens || 0}</Text>
-              <Text style={styles.statLabel}>Rerolls</Text>
-            </View>
-          </View>
-
-          <View style={styles.prefsCard}>
-            <Text style={styles.prefsHeader}>Action Domains</Text>
-            <Text style={styles.prefsSub}>Update your preferences to change the types of quests you receive.</Text>
-            <View style={styles.tagContainer}>
-              {CLIMATE_TAGS.map((tag) => {
-                const active = selectedInterests.includes(tag);
-                return (
-                  <TouchableOpacity key={tag} style={[styles.tagButton, active && styles.tagActive]} onPress={() => toggleTag(tag)}>
-                    <Text style={[styles.tagText, active && styles.tagActiveText]}>{tag}</Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </View>
-            <TouchableOpacity style={styles.savePrefsButton} onPress={savePreferences} disabled={savingPrefs}>
-              {savingPrefs ? <ActivityIndicator color="#fff" /> : <Text style={styles.savePrefsText}>Update Preferences</Text>}
+    <View style={{ flex: 1, backgroundColor: colors.ground }}>
+      <ScrollView contentContainerStyle={{ paddingBottom: TAB_BAR_SPACE + insets.bottom }}>
+        <View style={{ backgroundColor: colors.mint, borderBottomLeftRadius: 40, borderBottomRightRadius: 40, paddingTop: insets.top + 16, paddingHorizontal: 20, paddingBottom: 24, alignItems: 'center', gap: 10 }}>
+          <View>
+            <Avatar avatarKey={userData?.avatar} seed={uid} size={116} bg={colors.white} />
+            <TouchableOpacity
+              onPress={() => setAvatarOpen(true)}
+              accessibilityRole="button"
+              accessibilityLabel="Change your critter"
+              style={{ position: 'absolute', right: -4, bottom: -2, width: 44, height: 44, borderRadius: 22, borderWidth: 3, borderColor: colors.mint, backgroundColor: colors.ink, alignItems: 'center', justifyContent: 'center' }}
+            >
+              <Icon name="edit" size={18} color={colors.white} />
             </TouchableOpacity>
           </View>
-
-          <View style={styles.menuContainer}>
-            <TouchableOpacity style={styles.menuItem} onPress={handleLogout}>
-              <Ionicons name="log-out-outline" size={22} color="#E76F51" />
-              <Text style={[styles.menuText, { color: '#E76F51' }]}>Log Out</Text>
-            </TouchableOpacity>
+          <Text style={[type.h1, { marginTop: 4 }]} accessibilityRole="header">{userData?.userDisplayName || 'EcoActioner'}</Text>
+          <TouchableOpacity
+            onPress={() => setTitlesOpen(true)}
+            accessibilityRole="button"
+            accessibilityLabel={`Eco-Title: ${tier.title}. Show all titles`}
+            style={{ flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 44, backgroundColor: colors.white, borderRadius: 22, paddingHorizontal: 16 }}
+          >
+            <TierBadge tierKey={tier.key} size={18} />
+            <Text style={type.label}>{tier.title}</Text>
+            <Text style={[type.bodyMuted, { fontFamily: fonts.medium }]}>· all titles</Text>
+            <Icon name="forward" size={16} />
+          </TouchableOpacity>
+          <View style={{ alignSelf: 'stretch', marginTop: 4 }}>
+            <ProgressBar value={getTierProgress(score)} height={10} label={nextTier ? `${Math.round(getTierProgress(score) * 100)} percent of the way to ${nextTier.title}` : 'Top title reached'} />
+            <Text style={[type.small, { color: colors.ink, textAlign: 'center', marginTop: 6 }]}>{nextTier ? `${nextTier.min - score} pts to ${nextTier.title}` : 'You hold the top title'}</Text>
           </View>
         </View>
+
+        <View style={{ padding: 20, gap: 16 }}>
+          <View style={{ flexDirection: 'row', gap: 10 }}>
+            {[[score, 'Points'], [userData?.questsCompletedCount || 0, 'Actions'], [userData?.rerollTokens || 0, 'Swaps left']].map(([v, l]) => (
+              <View key={l} style={{ flex: 1, backgroundColor: colors.white, borderRadius: 20, paddingVertical: 14, alignItems: 'center', borderWidth: 1.5, borderColor: colors.line }} accessible accessibilityLabel={`${l}: ${v}`}>
+                <Text style={{ fontFamily: fonts.display, fontSize: 26, color: colors.ink }}>{v}</Text>
+                <Text style={[type.small, { fontFamily: fonts.bold }]}>{l}</Text>
+              </View>
+            ))}
+          </View>
+
+          <View style={{ backgroundColor: colors.white, borderRadius: 26, padding: 18, borderWidth: 1.5, borderColor: colors.line, gap: 12 }}>
+            <View>
+              <Text style={type.h3}>Action domains</Text>
+              <Text style={[type.bodyMuted, { marginTop: 3 }]}>Your quests lean towards these areas.</Text>
+            </View>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+              {CLIMATE_TAGS.map(tag => <Chip key={tag} label={tag} role="checkbox" selected={interests.includes(tag)} onPress={() => toggleTag(tag)} />)}
+            </View>
+            <Button label="Save changes" onPress={savePreferences} loading={savingPrefs} disabled={!prefsChanged} style={{ minHeight: 50 }} />
+          </View>
+
+          <TouchableOpacity
+            onPress={logout}
+            accessibilityRole="button"
+            style={{ flexDirection: 'row', alignItems: 'center', gap: 12, minHeight: 56, backgroundColor: colors.white, borderRadius: 22, paddingHorizontal: 18, borderWidth: 1.5, borderColor: colors.line }}
+          >
+            <Icon name="logout" size={22} />
+            <Text style={{ fontFamily: fonts.bold, fontSize: 16, color: colors.ink }}>Log out</Text>
+          </TouchableOpacity>
+        </View>
       </ScrollView>
+
+      {/* ECO-TITLES SHEET */}
+      <Sheet visible={titlesOpen} onClose={() => setTitlesOpen(false)} labelledBy="Eco-Titles">
+        <Text style={[type.h1, { fontSize: 28 }]} accessibilityRole="header">Eco-Titles</Text>
+        <Text style={type.bodyMuted}>Complete quests to earn points and move up. Each title has its own shape, so you can spot it anywhere in the app.</Text>
+        <View style={{ gap: 8, marginTop: 4 }}>
+          {[...ECO_TIERS].reverse().map(t => {
+            const current = t.key === tier.key;
+            const unlocked = score >= t.min;
+            return (
+              <View key={t.key}
+                accessible
+                accessibilityLabel={`${t.title}, ${t.min} points, ${current ? 'your current title' : unlocked ? 'unlocked' : 'locked'}`}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 14, paddingVertical: 12, paddingHorizontal: 14, borderRadius: 20, backgroundColor: current ? colors.mint : colors.ground, borderWidth: 2, borderColor: current ? colors.ink : 'transparent' }}>
+                <TierBadge tierKey={t.key} size={34} />
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontFamily: fonts.bold, fontSize: 16, color: colors.ink }}>{t.title}</Text>
+                  <Text style={[type.small, { marginTop: 1 }]}>{t.min} pts</Text>
+                </View>
+                {current ? (
+                  <View style={{ backgroundColor: colors.ink, borderRadius: 12, paddingVertical: 4, paddingHorizontal: 10 }}><Text style={{ fontFamily: fonts.bold, fontSize: 13, color: colors.white }}>You're here</Text></View>
+                ) : (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                    <Icon name={unlocked ? 'check' : 'lock'} size={16} color={unlocked ? colors.ink : colors.muted} strokeWidth={unlocked ? 2.6 : 2} />
+                    <Text style={{ fontFamily: fonts.bold, fontSize: 13, color: unlocked ? colors.ink : colors.muted }}>{unlocked ? 'Unlocked' : 'Locked'}</Text>
+                  </View>
+                )}
+              </View>
+            );
+          })}
+        </View>
+        <Button label="Close" variant="outline" onPress={() => setTitlesOpen(false)} style={{ borderWidth: 0 }} />
+      </Sheet>
+
+      {/* AVATAR PICKER SHEET */}
+      <Sheet visible={avatarOpen} onClose={() => setAvatarOpen(false)} labelledBy="Choose your critter">
+        <Text style={[type.h1, { fontSize: 28 }]} accessibilityRole="header">Choose your critter</Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10 }} accessibilityRole="radiogroup">
+          {AVATARS.map(a => {
+            const on = a.key === (userData?.avatar || null);
+            return (
+              <TouchableOpacity key={a.key} onPress={() => chooseAvatar(a.key)}
+                accessibilityRole="radio" accessibilityLabel={`${a.name} avatar`} accessibilityState={{ selected: on }}
+                style={{ width: '22.5%', height: 76, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: on ? colors.mint : colors.ground, borderWidth: on ? 3 : 2, borderColor: on ? colors.ink : 'transparent' }}>
+                <a.Component size={56} />
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+        <Button label="Close" variant="outline" onPress={() => setAvatarOpen(false)} style={{ borderWidth: 0 }} />
+      </Sheet>
     </View>
   );
 }
-
-const styles = StyleSheet.create({
-  mainContainer: { flex: 1, backgroundColor: '#F4F7F5' },
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  
-  headerBackground: { backgroundColor: '#2D6A4F', paddingBottom: 25, borderBottomLeftRadius: 25, borderBottomRightRadius: 25, paddingTop: 10 },
-  headerContent: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 20, marginTop: 10 },
-  greetingText: { color: 'rgba(255,255,255,0.8)', fontSize: 14, fontWeight: '600' },
-  headerTitle: { color: '#fff', fontSize: 24, fontWeight: 'bold' },
-  
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center' },
-  rankMenu: { width: '90%', backgroundColor: '#fff', borderRadius: 24, padding: 25, shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 15 },
-  rankMenuTitle: { fontSize: 22, fontWeight: 'bold', color: '#1B4332', textAlign: 'center', marginBottom: 5 },
-  rankMenuSub: { fontSize: 13, color: '#666', textAlign: 'center', marginBottom: 20, lineHeight: 18 },
-  tierRow: { flexDirection: 'row', alignItems: 'center', padding: 12, borderRadius: 16, backgroundColor: '#F9FBF9', marginBottom: 10, borderWidth: 1, borderColor: '#EBF4EE' },
-  tierRowUnlocked: { backgroundColor: '#EBF4EE', borderColor: '#52B788' },
-  tierEmoji: { fontSize: 32, marginRight: 15 },
-  tierTitle: { fontSize: 16, fontWeight: 'bold', color: '#777' },
-  tierTitleUnlocked: { color: '#1B4332' },
-  tierScore: { fontSize: 12, color: '#666', marginTop: 2 },
-
-  scrollContainer: { flex: 1, marginTop: -20 },
-  cardContainer: { paddingHorizontal: 20 },
-  
-  profileCard: { backgroundColor: '#fff', alignItems: 'center', padding: 25, borderRadius: 20, elevation: 5, shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 10 },
-  avatarWrapper: { position: 'relative', marginBottom: 12 },
-  avatarCircle: { width: 80, height: 80, borderRadius: 40, backgroundColor: '#2D6A4F', justifyContent: 'center', alignItems: 'center' },
-  avatarImage: { width: 80, height: 80, borderRadius: 40, backgroundColor: '#eee' },
-  avatarText: { fontSize: 32, fontWeight: 'bold', color: '#fff' },
-  editIconBadge: { position: 'absolute', bottom: 0, right: 0, backgroundColor: '#52B788', width: 26, height: 26, borderRadius: 13, justifyContent: 'center', alignItems: 'center', borderWidth: 2, borderColor: '#fff' },
-  
-  nameText: { fontSize: 22, fontWeight: 'bold', color: '#1B4332' },
-  titlePill: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#EBF4EE', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12, marginTop: 8 },
-  titlePillText: { color: '#2D6A4F', fontWeight: 'bold', fontSize: 13 },
-  emailText: { fontSize: 14, color: '#888', marginTop: 10 },
-  
-  statsContainer: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 20 },
-  statBox: { backgroundColor: '#fff', flex: 1, marginHorizontal: 4, padding: 15, borderRadius: 16, alignItems: 'center', elevation: 2, shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 5 },
-  statNum: { fontSize: 20, fontWeight: 'bold', color: '#1B4332', marginTop: 8 },
-  statLabel: { fontSize: 12, color: '#666', marginTop: 2, fontWeight: '600' },
-  
-  prefsCard: { backgroundColor: '#fff', padding: 20, borderRadius: 16, marginTop: 20, elevation: 2, shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 5 },
-  prefsHeader: { fontSize: 18, fontWeight: 'bold', color: '#1B4332', marginBottom: 6 },
-  prefsSub: { fontSize: 13, color: '#666', marginBottom: 15, lineHeight: 18 },
-  tagContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 20 },
-  tagButton: { backgroundColor: '#f0f0f0', paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20 },
-  tagActive: { backgroundColor: '#2D6A4F' },
-  tagText: { color: '#444', fontWeight: '600', fontSize: 13 },
-  tagActiveText: { color: '#fff' },
-  savePrefsButton: { backgroundColor: '#52B788', padding: 14, borderRadius: 12, alignItems: 'center' },
-  savePrefsText: { color: '#fff', fontWeight: 'bold', fontSize: 15 },
-
-  menuContainer: { marginTop: 20 },
-  menuItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', padding: 18, borderRadius: 16, elevation: 1, shadowColor: '#000', shadowOpacity: 0.03, shadowRadius: 3 },
-  menuText: { flex: 1, marginLeft: 14, fontSize: 16, fontWeight: '700' },
-});

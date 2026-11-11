@@ -1,29 +1,21 @@
 // src/screens/LoadingScreen.js
+// Shown before custom fonts load, so it uses the system font.
 import React from 'react';
-import { View, Text, StyleSheet, ActivityIndicator } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { Ionicons } from '@expo/vector-icons'; 
+import { View, Text, ActivityIndicator } from 'react-native';
+import { Earth } from '../ui/Critters';
+import { colors } from '../ui/theme';
 
 export default function LoadingScreen() {
   return (
-    <SafeAreaView style={styles.container}>
-      <View style={styles.content}>
-        <View style={styles.iconContainer}>
-          <Ionicons name="leaf" size={70} color="#fff" />
-        </View>
-        <Text style={styles.title}>ECO QUEST</Text>
-        <Text style={styles.subtitle}>Micro-Actions for Macro Impact</Text>
-        <ActivityIndicator size="large" color="#fff" style={styles.spinner} />
+    <View style={{ flex: 1, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center', gap: 24 }}>
+      <View style={{ position: 'absolute', left: -80, top: -60, width: 260, height: 260, borderRadius: 130, backgroundColor: colors.mintDeep }} />
+      <View style={{ position: 'absolute', right: -90, bottom: -70, width: 300, height: 300, borderRadius: 150, backgroundColor: colors.pistachio }} />
+      <View accessible accessibilityRole="image" accessibilityLabel="Eco Quest logo, a smiling Earth"><Earth size={190} /></View>
+      <View style={{ alignItems: 'center' }}>
+        <Text style={{ fontSize: 52, fontWeight: '900', color: colors.ink, letterSpacing: -1.5, textAlign: 'center', lineHeight: 52 }}>ECO{'\n'}QUEST</Text>
+        <Text style={{ fontSize: 17, color: colors.ink, marginTop: 12 }}>Small actions, every day.</Text>
       </View>
-    </SafeAreaView>
+      <ActivityIndicator color={colors.ink} style={{ position: 'absolute', bottom: 72 }} accessibilityLabel="Loading" />
+    </View>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#2D6A4F', justifyContent: 'center', alignItems: 'center' },
-  content: { alignItems: 'center' },
-  iconContainer: { marginBottom: 20, backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 50, padding: 20 },
-  title: { fontSize: 36, fontWeight: 'bold', color: '#fff', letterSpacing: 2 },
-  subtitle: { fontSize: 16, color: 'rgba(255,255,255,0.85)', marginBottom: 40, marginTop: 8 },
-  spinner: { marginTop: 10 },
-});

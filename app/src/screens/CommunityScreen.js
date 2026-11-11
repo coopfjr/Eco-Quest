@@ -1,49 +1,77 @@
 // src/screens/CommunityScreen.js
 import React, { useState, useEffect, useCallback } from 'react';
-import { View, Text, StyleSheet, ActivityIndicator, FlatList, TouchableOpacity, Image, RefreshControl, TextInput, Alert, Modal, ScrollView } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { Ionicons } from '@expo/vector-icons'; 
+import { View, Text, ActivityIndicator, FlatList, TouchableOpacity, Image, RefreshControl, TextInput, Alert } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { db, auth } from '../firebaseConfig';
-import { collection, query, orderBy, limit, startAfter, getDocs, getDoc, doc, runTransaction, increment, updateDoc, arrayUnion, arrayRemove, deleteDoc } from 'firebase/firestore';
+import { collection, query, where, orderBy, limit, startAfter, getDocs, getDoc, doc, runTransaction, increment, updateDoc, arrayUnion, arrayRemove, deleteDoc, getCountFromServer } from 'firebase/firestore';
 import * as Haptics from 'expo-haptics';
+import { getTier, getTierBounds } from '../ecoTiers';
+import { Avatar, Earth } from '../ui/Critters';
+import { TierBadge, DifficultyIcon, AwardCoin } from '../ui/Badges';
+import Icon from '../ui/Icons';
+import { Button, IconButton, Segmented, ScopeChips, Sheet } from '../ui/components';
+import { TAB_BAR_SPACE } from '../ui/TabBar';
+import { colors, difficultyTheme, fonts, type } from '../ui/theme';
 
 const PAGE_SIZE = 10;
+const LEADERBOARD_SIZE = 50;
+const FLAG_HIDE_THRESHOLD = 3; // posts reported by this many people are hidden from the feed
 
+// Fixed award values so a gift means the same thing to sender and receiver
+// (Perry: common ground). The points are transferred to the post's author.
 const AWARDS = [
-  { id: 'leaf', icon: '🌱', name: 'Sprout', cost: 10 },
-  { id: 'tree', icon: '🌳', name: 'Canopy', cost: 25 },
-  { id: 'water', icon: '💧', name: 'Pure', cost: 50 },
-  { id: 'planet', icon: '🌍', name: 'Earth Keeper', cost: 100 },
+  { id: 'leaf', name: 'Sprout', cost: 10 },
+  { id: 'tree', name: 'Canopy', cost: 25 },
+  { id: 'water', name: 'Pure', cost: 50 },
+  { id: 'planet', name: 'Earth Keeper', cost: 100 },
 ];
+const MEDAL_BG = { 1: '#D9E58A', 2: colors.seafoam, 3: colors.pistachio };
 
-const getEcoTitle = (score) => {
-  if (score >= 1000) return "Global Guardian 🌍";
-  if (score >= 500) return "Forest Ranger 🌳";
-  if (score >= 200) return "River Keeper 💧";
-  if (score >= 50) return "Sprout 🌱";
-  return "Seedling 🌰";
+const usersRef = collection(db, 'Users');
+
+const mapUser = (d) => {
+  const dat = d.data();
+  return { id: d.id, avatar: dat.avatar || null, displayName: dat.userDisplayName || 'EcoActioner', score: dat.score || 0 };
 };
 
-const getEcoEmoji = (score) => {
-  if (score >= 1000) return "🌍";
-  if (score >= 500) return "🌳";
-  if (score >= 200) return "💧";
-  if (score >= 50) return "🌱";
-  return "🌰";
+// Standard competition ranking: tied scores share a rank.
+const rankList = (list) => {
+  const sorted = [...list].sort((a, b) => b.score - a.score);
+  let prevScore = null;
+  let prevRank = 0;
+  return sorted.map((u, i) => {
+    const rank = u.score === prevScore ? prevRank : i + 1;
+    prevScore = u.score;
+    prevRank = rank;
+    return { ...u, rank };
+  });
+};
+
+const formatDate = (d) => {
+  const today = new Date();
+  const yest = new Date(); yest.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return 'Today';
+  if (d.toDateString() === yest.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
 };
 
 export default function CommunityScreen() {
-  const [activeTab, setActiveTab] = useState('feed'); 
-  const [feedFilter, setFeedFilter] = useState('global'); 
+  const insets = useSafeAreaInsets();
+  const [activeTab, setActiveTab] = useState('feed');
+  const [feedFilter, setFeedFilter] = useState('global');
+  const [rankFilter, setRankFilter] = useState('tier'); // default: compare with people at your own title
   const [following, setFollowing] = useState([]);
-  const [leaderboard, setLeaderboard] = useState([]);
+  const [me, setMe] = useState(null);
+  const [boards, setBoards] = useState({ tier: [], following: [], global: [] });
+  const [myRanks, setMyRanks] = useState({ tier: null, following: null, global: null });
   const [feed, setFeed] = useState([]);
   const [searchQuery, setSearchQuery] = useState('');
-  const [awardModalVisible, setAwardModalVisible] = useState(false);
+
   const [postToAward, setPostToAward] = useState(null);
-  
-  const [selectedProfile, setSelectedProfile] = useState(null);
-  const [profileModalVisible, setProfileModalVisible] = useState(false);
+  const [selectedAward, setSelectedAward] = useState('tree');
+  const [giftBusy, setGiftBusy] = useState(false);
+
+  const [member, setMember] = useState(null);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -51,60 +79,81 @@ export default function CommunityScreen() {
   const [hasMoreFeed, setHasMoreFeed] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
 
+  // Attach each author's current handle, avatar and title. Names always come from the
+  // chosen handle, never the email address.
+  const hydratePosts = async (docs) => {
+    const cache = {};
+    const posts = [];
+    for (const d of docs) {
+      const dat = d.data();
+      if (dat.flaggedCount && dat.flaggedCount >= FLAG_HIDE_THRESHOLD) continue;
+      if (!(dat.userId in cache)) {
+        const a = await getDoc(doc(db, 'Users', dat.userId));
+        cache[dat.userId] = a.exists() ? a.data() : {};
+      }
+      const author = cache[dat.userId];
+      posts.push({
+        id: d.id,
+        ...dat,
+        authorName: author.userDisplayName || 'EcoActioner',
+        authorAvatar: author.avatar || null,
+        authorScore: author.score || 0,
+        createdAt: dat.timestamp ? dat.timestamp.toDate() : new Date(),
+      });
+    }
+    return posts;
+  };
+
+  const loadLeaderboards = async (myId, myScore, myFollowing) => {
+    const { min, max } = getTierBounds(myScore);
+    const tierFilters = max !== null ? [where('score', '>=', min), where('score', '<', max)] : [where('score', '>=', min)];
+    const tierAboveFilters = max !== null ? [where('score', '>', myScore), where('score', '<', max)] : [where('score', '>', myScore)];
+
+    const [globalSnap, tierSnap, followDocs, globalAbove, tierAbove] = await Promise.all([
+      getDocs(query(usersRef, orderBy('score', 'desc'), limit(LEADERBOARD_SIZE))),
+      getDocs(query(usersRef, ...tierFilters, orderBy('score', 'desc'), limit(LEADERBOARD_SIZE))),
+      Promise.all([myId, ...myFollowing].map(id => getDoc(doc(db, 'Users', id)))),
+      getCountFromServer(query(usersRef, where('score', '>', myScore))),
+      getCountFromServer(query(usersRef, ...tierAboveFilters)),
+    ]);
+    const followingBoard = rankList(followDocs.filter(d => d.exists()).map(mapUser));
+    setBoards({ global: rankList(globalSnap.docs.map(mapUser)), tier: rankList(tierSnap.docs.map(mapUser)), following: followingBoard });
+    // Your own rank comes from the server, so it shows even outside the top 50.
+    setMyRanks({
+      global: globalAbove.data().count + 1,
+      tier: tierAbove.data().count + 1,
+      following: followingBoard.find(u => u.id === myId)?.rank || 1,
+    });
+  };
+
   const loadData = useCallback(async () => {
     try {
       const currentUser = auth.currentUser;
+      let myFollowing = [];
       if (currentUser) {
         const userDoc = await getDoc(doc(db, 'Users', currentUser.uid));
         if (userDoc.exists()) {
-          setFollowing(userDoc.data().following || []);
+          const data = userDoc.data();
+          myFollowing = data.following || [];
+          setFollowing(myFollowing);
+          setMe({ id: currentUser.uid, displayName: data.userDisplayName || 'EcoActioner', avatar: data.avatar || null, score: data.score || 0 });
+          try {
+            await loadLeaderboards(currentUser.uid, data.score || 0, myFollowing);
+          } catch (e) {
+            console.error('Leaderboard error:', e);
+          }
         }
       }
-
-      const qLeader = query(collection(db, 'Users'), orderBy('score', 'desc'), limit(50));
-      const snapLeader = await getDocs(qLeader);
-      const users = [];
-      snapLeader.forEach((d) => {
-        const dat = d.data();
-        if (dat.score >= 0) users.push({ id: d.id, profilePic: dat.profilePic, displayName: dat.userDisplayName || (dat.email ? dat.email.split('@')[0] : 'User'), score: dat.score });
-      });
-      const ranked = users.map((u, i) => ({ ...u, rank: i + 1 }));
-      setLeaderboard(ranked);
-
-      const qFeed = query(collection(db, 'CommunityPosts'), orderBy('timestamp', 'desc'), limit(PAGE_SIZE));
-      const snapFeed = await getDocs(qFeed);
-      const posts = [];
-      
-      for (const d of snapFeed.docs) {
-        const dat = d.data();
-        if (!dat.flaggedCount || dat.flaggedCount < 3) {
-          const authorDoc = await getDoc(doc(db, 'Users', dat.userId));
-          const authorData = authorDoc.exists() ? authorDoc.data() : {};
-          
-          posts.push({ 
-            id: d.id, 
-            ...dat, 
-            authorProfilePic: authorData.profilePic || null, 
-            authorScore: authorData.score || 0,
-            createdAt: dat.timestamp ? dat.timestamp.toDate() : new Date() 
-          });
-        }
-      }
-      setFeed(posts);
-      if (snapFeed.docs.length > 0) {
-        setLastFeedDoc(snapFeed.docs[snapFeed.docs.length - 1]);
-        setHasMoreFeed(snapFeed.docs.length >= PAGE_SIZE);
-      } else {
-        setHasMoreFeed(false);
-      }
+      const snapFeed = await getDocs(query(collection(db, 'CommunityPosts'), orderBy('timestamp', 'desc'), limit(PAGE_SIZE)));
+      setFeed(await hydratePosts(snapFeed.docs));
+      setLastFeedDoc(snapFeed.docs[snapFeed.docs.length - 1] || null);
+      setHasMoreFeed(snapFeed.docs.length >= PAGE_SIZE);
     } catch (e) {
-      console.error("Community data error:", e);
+      console.error('Community data error:', e);
     }
   }, []);
 
-  useEffect(() => {
-    loadData().then(() => setLoading(false));
-  }, [loadData]);
+  useEffect(() => { loadData().then(() => setLoading(false)); }, [loadData]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -115,600 +164,458 @@ export default function CommunityScreen() {
   const handleLoadMore = async () => {
     if (activeTab !== 'feed' || !lastFeedDoc || !hasMoreFeed || loadingMore) return;
     setLoadingMore(true);
-
     try {
-      const qFeed = query(collection(db, 'CommunityPosts'), orderBy('timestamp', 'desc'), startAfter(lastFeedDoc), limit(PAGE_SIZE));
-      const snapFeed = await getDocs(qFeed);
-      const newPosts = [];
-      
-      for (const d of snapFeed.docs) {
-        const dat = d.data();
-        if (!dat.flaggedCount || dat.flaggedCount < 3) {
-          const authorDoc = await getDoc(doc(db, 'Users', dat.userId));
-          const authorData = authorDoc.exists() ? authorDoc.data() : {};
-          
-          newPosts.push({ 
-            id: d.id, 
-            ...dat, 
-            authorProfilePic: authorData.profilePic || null, 
-            authorScore: authorData.score || 0,
-            createdAt: dat.timestamp ? dat.timestamp.toDate() : new Date() 
-          });
-        }
-      }
-
-      setFeed(prev => [...prev, ...newPosts]);
-      if (snapFeed.docs.length > 0) {
-        setLastFeedDoc(snapFeed.docs[snapFeed.docs.length - 1]);
-        setHasMoreFeed(snapFeed.docs.length >= PAGE_SIZE);
-      } else {
-        setHasMoreFeed(false);
-      }
+      const snap = await getDocs(query(collection(db, 'CommunityPosts'), orderBy('timestamp', 'desc'), startAfter(lastFeedDoc), limit(PAGE_SIZE)));
+      const more = await hydratePosts(snap.docs);
+      setFeed(prev => [...prev, ...more]);
+      setLastFeedDoc(snap.docs[snap.docs.length - 1] || lastFeedDoc);
+      setHasMoreFeed(snap.docs.length >= PAGE_SIZE);
     } catch (e) {
-      console.error("Pagination error:", e);
+      console.error('Pagination error:', e);
     } finally {
       setLoadingMore(false);
     }
   };
 
-  const handleSearch = (text) => {
-    setSearchQuery(text);
-  };
-
-  const handleToggleFollow = async (targetUserId) => {
+  const toggleFollow = async (targetId) => {
     const user = auth.currentUser;
     if (!user) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    const userRef = doc(db, 'Users', user.uid);
-    const isFollowing = following.includes(targetUserId);
-
+    const isFollowing = following.includes(targetId);
     try {
-      if (isFollowing) {
-        await updateDoc(userRef, { following: arrayRemove(targetUserId) });
-        setFollowing(prev => prev.filter(id => id !== targetUserId));
-      } else {
-        await updateDoc(userRef, { following: arrayUnion(targetUserId) });
-        setFollowing(prev => [...prev, targetUserId]);
-      }
-      if (selectedProfile && selectedProfile.id === targetUserId) {
-        setSelectedProfile(prev => ({ ...prev, isFollowing: !isFollowing }));
-      }
+      await updateDoc(doc(db, 'Users', user.uid), { following: isFollowing ? arrayRemove(targetId) : arrayUnion(targetId) });
+      setFollowing(prev => isFollowing ? prev.filter(id => id !== targetId) : [...prev, targetId]);
     } catch (e) {
-      console.error("Follow error", e);
+      console.error('Follow error', e);
     }
   };
 
-  const handleOpenUserProfile = async (userId) => {
+  const openMember = async (userId) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     try {
-      const userDoc = await getDoc(doc(db, 'Users', userId));
-      if (userDoc.exists()) {
-        const data = userDoc.data();
-        const foundRank = leaderboard.find(u => u.id === userId)?.rank || '50+';
+      const snap = await getDoc(doc(db, 'Users', userId));
+      if (!snap.exists()) return;
+      const data = snap.data();
+      const score = data.score || 0;
+      const [above, recentSnap] = await Promise.all([
+        getCountFromServer(query(usersRef, where('score', '>', score))),
+        getDocs(query(collection(db, 'CommunityPosts'), where('userId', '==', userId), limit(10))),
+      ]);
+      const recent = recentSnap.docs
+        .map(d => ({ id: d.id, ...d.data() }))
+        .sort((a, b) => (b.timestamp?.toMillis?.() || 0) - (a.timestamp?.toMillis?.() || 0))
+        .slice(0, 3);
+      setMember({
+        id: userId,
+        displayName: data.userDisplayName || 'EcoActioner',
+        avatar: data.avatar || null,
+        score,
+        questsCompletedCount: data.questsCompletedCount || 0,
+        rank: above.data().count + 1,
+        recent,
+      });
+    } catch (e) {
+      Alert.alert('Error', 'Could not load this profile.');
+    }
+  };
 
-        setSelectedProfile({
-          id: userId,
-          displayName: data.userDisplayName || 'User',
-          profilePic: data.profilePic || null,
-          score: data.score || 0,
-          questsCompletedCount: data.questsCompletedCount || 0,
-          rank: foundRank,
-          isFollowing: following.includes(userId)
+  const deletePost = (postId) => {
+    Alert.alert('Delete post?', 'This removes it from the community feed.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: async () => {
+        try { await deleteDoc(doc(db, 'CommunityPosts', postId)); handleRefresh(); }
+        catch (e) { Alert.alert('Error', 'Could not delete the post.'); }
+      } },
+    ]);
+  };
+
+  const reportPost = (postId) => {
+    Alert.alert('Report post?', `Posts reported by ${FLAG_HIDE_THRESHOLD} people are hidden from the feed.`, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Report', style: 'destructive', onPress: async () => {
+        try {
+          await updateDoc(doc(db, 'CommunityPosts', postId), { flaggedCount: increment(1) });
+          Alert.alert('Reported', 'Thanks. This post has been flagged.');
+          handleRefresh();
+        } catch (e) { Alert.alert('Error', 'Could not report the post.'); }
+      } },
+    ]);
+  };
+
+  const toggleLike = async (post) => {
+    const user = auth.currentUser;
+    if (!user) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    const liked = post.likedBy?.includes(user.uid);
+    // Optimistic update so the heart responds instantly.
+    setFeed(prev => prev.map(p => p.id !== post.id ? p : {
+      ...p,
+      likes: (p.likes || 0) + (liked ? -1 : 1),
+      likedBy: liked ? (p.likedBy || []).filter(id => id !== user.uid) : [...(p.likedBy || []), user.uid],
+    }));
+    try {
+      await updateDoc(doc(db, 'CommunityPosts', post.id), liked
+        ? { likedBy: arrayRemove(user.uid), likes: increment(-1) }
+        : { likedBy: arrayUnion(user.uid), likes: increment(1) });
+    } catch (e) {
+      handleRefresh();
+    }
+  };
+
+  const openGift = (post) => {
+    if (post.userId === auth.currentUser?.uid) return;
+    setSelectedAward('tree');
+    setPostToAward(post);
+  };
+
+  // The sheet is the confirmation step: pick an award, see the balance change, confirm.
+  const sendGift = async () => {
+    const user = auth.currentUser;
+    const award = AWARDS.find(a => a.id === selectedAward);
+    if (!user || !postToAward || !award || giftBusy) return;
+    setGiftBusy(true);
+    try {
+      await runTransaction(db, async (t) => {
+        const userRef = doc(db, 'Users', user.uid);
+        const recipientRef = doc(db, 'Users', postToAward.userId);
+        const postRef = doc(db, 'CommunityPosts', postToAward.id);
+        const userDoc = await t.get(userRef);
+        const recipientDoc = await t.get(recipientRef);
+        if (!recipientDoc.exists()) throw new Error('NO_RECIPIENT');
+        const cur = userDoc.data().score || 0;
+        if (cur < award.cost) throw new Error('LOW_FUNDS');
+        t.update(userRef, { score: cur - award.cost });
+        t.update(recipientRef, {
+          score: (recipientDoc.data().score || 0) + award.cost,
+          giftPointsReceived: (recipientDoc.data().giftPointsReceived || 0) + award.cost,
         });
-        setProfileModalVisible(true);
-      }
+        t.update(postRef, { [`awards.${award.id}`]: increment(1) });
+      });
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setPostToAward(null);
+      handleRefresh();
     } catch (e) {
-      Alert.alert("Error", "Could not load user profile.");
+      if (e.message === 'LOW_FUNDS') Alert.alert('Not enough points', `This award needs ${award.cost} points.`);
+      else if (e.message === 'NO_RECIPIENT') Alert.alert('Unavailable', 'This person no longer has an account.');
+      else Alert.alert('Error', 'Could not send the award.');
+    } finally {
+      setGiftBusy(false);
     }
   };
 
-  const handleDeletePost = (postId) => {
-    Alert.alert("Delete Post", "Are you sure you want to remove this?", [
-      { text: "Cancel", style: "cancel" },
-      { text: "Delete", style: "destructive", onPress: async () => {
-        try {
-          await deleteDoc(doc(db, "CommunityPosts", postId));
-          handleRefresh();
-        } catch (e) {
-          Alert.alert("Error", "Could not delete post.");
-        }
-      }}
-    ]);
-  };
+  // ---------- derived ----------
+  const myId = auth.currentUser?.uid;
+  const myScore = me?.score || 0;
+  const myTier = getTier(myScore);
+  const { min: tierMin, max: tierMax } = getTierBounds(myScore);
+  const board = boards[rankFilter] || [];
+  const nextAbove = [...board].filter(u => u.score > myScore).sort((a, b) => a.score - b.score)[0];
 
-  const handleReportPost = (postId) => {
-    Alert.alert("Report Post", "Flag this post for community review?", [
-      { text: "Cancel", style: "cancel" },
-      { text: "Report", style: "destructive", onPress: async () => {
-        try {
-          const postRef = doc(db, "CommunityPosts", postId);
-          await updateDoc(postRef, { flaggedCount: increment(1) });
-          Alert.alert("Reported", "Thank you. This post has been flagged.");
-          handleRefresh();
-        } catch (e) {
-          Alert.alert("Error", "Could not report post.");
-        }
-      }}
-    ]);
-  };
+  const displayData = activeTab === 'feed'
+    ? (feedFilter === 'global' ? feed : feed.filter(p => following.includes(p.userId)))
+    : (searchQuery ? board.filter(u => u.displayName.toLowerCase().includes(searchQuery.toLowerCase())) : board);
 
-  const handleLike = async (post) => {
-    const user = auth.currentUser;
-    if (!user) return;
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  const leagueTitle = rankFilter === 'tier' ? `${myTier.title} league` : rankFilter === 'following' ? 'You + people you follow' : 'Everyone';
+  const leagueSub = rankFilter === 'tier'
+    ? (tierMax !== null ? `Everyone with ${tierMin} to ${tierMax - 1} points` : `Everyone with ${tierMin}+ points`)
+    : rankFilter === 'following' ? `${following.length} people followed` : 'All Eco Quest members';
 
-    const postRef = doc(db, 'CommunityPosts', post.id);
-    const isLiked = post.likedBy && post.likedBy.includes(user.uid);
+  // ---------- renderers ----------
+  const renderHeader = () => (
+    <View style={{ gap: 14, marginBottom: 14 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Text style={[type.h1, { fontSize: 34 }]} accessibilityRole="header">Community</Text>
+        <Earth size={46} />
+      </View>
+      <Segmented options={[{ key: 'feed', label: 'Posts' }, { key: 'leaderboard', label: 'Rankings' }]} value={activeTab} onChange={(k) => { setActiveTab(k); setSearchQuery(''); }} />
+      {activeTab === 'feed'
+        ? <ScopeChips options={[{ key: 'global', label: 'Global' }, { key: 'following', label: 'Following' }]} value={feedFilter} onChange={setFeedFilter} />
+        : <ScopeChips options={[{ key: 'tier', label: 'My Title' }, { key: 'following', label: 'Following' }, { key: 'global', label: 'Global' }]} value={rankFilter} onChange={setRankFilter} />}
 
-    try {
-      if (isLiked) {
-        await updateDoc(postRef, { likedBy: arrayRemove(user.uid), likes: increment(-1) });
-      } else {
-        await updateDoc(postRef, { likedBy: arrayUnion(user.uid), likes: increment(1) });
-      }
-      handleRefresh(); 
-    } catch (e) {
-      console.error("Like error", e);
-    }
-  };
-
-  const giveAward = async (award) => {
-    const user = auth.currentUser;
-    if (!user || !postToAward) return;
-    if (postToAward.userId === user.uid) {
-      Alert.alert("Notice", "You cannot gift your own post.");
-      return;
-    }
-    setAwardModalVisible(false);
-
-    Alert.alert(
-      "Confirm Gift Purchase", 
-      `Are you sure you want to spend ${award.cost} Eco Points to send a ${award.name} award?`, 
-      [
-        { text: "Cancel", style: "cancel" },
-        { text: "Confirm Gift", onPress: async () => {
-            try {
-              await runTransaction(db, async (t) => {
-                const userRef = doc(db, "Users", user.uid);
-                const postRef = doc(db, "CommunityPosts", postToAward.id);
-                const userDoc = await t.get(userRef);
-                const curScore = userDoc.data().score || 0;
-
-                if (curScore < award.cost) throw new Error("LOW_FUNDS");
-
-                t.update(userRef, { score: increment(-award.cost) });
-                t.update(postRef, { [`awards.${award.id}`]: increment(1) });
-              });
-              Alert.alert("Gift Sent!", `Sent ${award.name} for ${award.cost} pts.`);
-              handleRefresh();
-            } catch (e) {
-              if (e.message === "LOW_FUNDS") Alert.alert("Insufficient Points", `Requires ${award.cost} points.`);
-              else Alert.alert("Error", "Could not send gift.");
-            }
-        }}
-      ]
-    );
-  };
-
-  const getLeaderboardData = () => {
-    let list = leaderboard;
-    if (feedFilter === 'following') {
-      const currentUserId = auth.currentUser?.uid;
-      list = leaderboard.filter(u => u.id === currentUserId || following.includes(u.id));
-    }
-    if (searchQuery) {
-      list = list.filter(u => u.displayName.toLowerCase().includes(searchQuery.toLowerCase()));
-    }
-    return list.map((u, index) => ({ ...u, rank: index + 1 }));
-  };
-
-  const currentUserId = auth.currentUser?.uid;
-  const leaderboardData = getLeaderboardData();
-  const currentUserRankObj = leaderboard.find(u => u.id === currentUserId);
-
-  const displayData = activeTab === 'feed' 
-    ? (feedFilter === 'global' ? feed : feed.filter(post => following.includes(post.userId)))
-    : leaderboardData;
-
-  const renderLeaderboardHeader = () => {
-    if (activeTab !== 'leaderboard') return null;
-
-    return (
-      <View style={{ marginBottom: 10 }}>
-        <View style={styles.searchBar}>
-          <Ionicons name="search" size={18} color="#777" />
-          <TextInput style={styles.input} placeholder="Search members..." value={searchQuery} onChangeText={handleSearch} />
-        </View>
-
-        {currentUserRankObj && !searchQuery && (
-          <View style={styles.pinnedUserSection}>
-            <Text style={styles.pinnedHeaderTitle}>YOUR RANKING</Text>
-            <TouchableOpacity style={styles.pinnedCard} onPress={() => handleOpenUserProfile(currentUserRankObj.id)}>
-              <Text style={styles.pinnedRankNum}>#{currentUserRankObj.rank}</Text>
-              {currentUserRankObj.profilePic ? (
-                <Image source={{ uri: currentUserRankObj.profilePic }} style={styles.smallAvatar} />
-              ) : (
-                <View style={styles.smallAvatarPlaceholder}>
-                  <Text style={{ color: '#fff', fontSize: 10, fontWeight: 'bold' }}>{currentUserRankObj.displayName[0].toUpperCase()}</Text>
-                </View>
-              )}
-              <Text style={styles.pinnedName}>{currentUserRankObj.displayName} {getEcoEmoji(currentUserRankObj.score)}</Text>
-              <Text style={styles.pinnedScoreText}>{currentUserRankObj.score} pts</Text>
-              <View style={styles.youBadge}>
-                <Text style={styles.youBadgeText}>You</Text>
+      {activeTab === 'leaderboard' && me && (
+        <>
+          <View style={{ backgroundColor: colors.sage, borderRadius: 26, padding: 16, gap: 14 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+              {rankFilter === 'tier' ? <TierBadge tierKey={myTier.key} size={36} /> : <Icon name={rankFilter === 'following' ? 'people' : 'leaf'} size={30} />}
+              <View style={{ flex: 1 }}>
+                <Text style={type.h2}>{leagueTitle}</Text>
+                <Text style={[type.small, { marginTop: 2 }]}>{leagueSub}</Text>
+              </View>
+            </View>
+            <TouchableOpacity
+              onPress={() => openMember(me.id)}
+              accessibilityRole="button"
+              accessibilityLabel={`Your rank: number ${myRanks[rankFilter] || '-'}, ${myScore} points${nextAbove ? `, ${nextAbove.score - myScore + 1} points to pass ${nextAbove.displayName}` : ''}`}
+              style={{ backgroundColor: colors.ink, borderRadius: 20, padding: 14, flexDirection: 'row', alignItems: 'center', gap: 12 }}
+            >
+              <Text style={{ fontFamily: fonts.display, fontSize: 26, color: colors.white }}>#{myRanks[rankFilter] || '–'}</Text>
+              <Avatar avatarKey={me.avatar} seed={me.id} size={44} bg={colors.mint} />
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontFamily: fonts.bold, fontSize: 16, color: colors.white }}>You · {myScore} pts</Text>
+                <Text style={{ fontFamily: fonts.body, fontSize: 13, color: colors.onInkMuted, marginTop: 2 }}>
+                  {nextAbove ? `${nextAbove.score - myScore + 1} pts to pass ${nextAbove.displayName}` : 'Top of this list'}
+                </Text>
               </View>
             </TouchableOpacity>
-            <View style={styles.sectionDivider} />
-            <Text style={styles.pinnedHeaderTitle}>LEADERBOARD</Text>
           </View>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, height: 50, borderRadius: 25, backgroundColor: colors.white, borderWidth: 1.5, borderColor: colors.line, paddingHorizontal: 16 }}>
+            <Icon name="search" size={20} color={colors.muted} />
+            <TextInput
+              style={{ flex: 1, fontFamily: fonts.body, fontSize: 15, color: colors.ink }}
+              placeholder={`Search ${rankFilter === 'tier' ? myTier.title : ''} members`.replace('  ', ' ')}
+              placeholderTextColor={colors.muted}
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+              accessibilityLabel="Search members in this ranking"
+            />
+          </View>
+        </>
+      )}
+    </View>
+  );
+
+  const renderLeaderRow = (item) => {
+    const isMe = item.id === myId;
+    const isFollowing = following.includes(item.id);
+    return (
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 8, paddingHorizontal: 10, borderRadius: 18, backgroundColor: isMe ? colors.mint : colors.white, marginBottom: 4 }}>
+        <TouchableOpacity
+          onPress={() => openMember(item.id)}
+          style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 44 }}
+          accessibilityRole="button"
+          accessibilityLabel={`Rank ${item.rank}, ${item.displayName}${isMe ? ' (you)' : ''}, ${getTier(item.score).title}, ${item.score} points`}
+        >
+          {MEDAL_BG[item.rank]
+            ? <View style={{ width: 34, height: 34, borderRadius: 17, backgroundColor: MEDAL_BG[item.rank], alignItems: 'center', justifyContent: 'center' }}><Text style={{ fontFamily: fonts.display, fontSize: 15, color: colors.ink }}>{item.rank}</Text></View>
+            : <Text style={{ width: 34, textAlign: 'center', fontFamily: fonts.display, fontSize: 15, color: colors.muted }}>{item.rank}</Text>}
+          <Avatar avatarKey={item.avatar} seed={item.id} size={38} />
+          <Text style={{ flex: 1, fontFamily: fonts.bold, fontSize: 16, color: colors.ink }} numberOfLines={1}>{item.displayName}</Text>
+          <Text style={type.label}>{item.score}</Text>
+        </TouchableOpacity>
+        {isMe ? (
+          <View style={{ minWidth: 76, alignItems: 'center', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 14, backgroundColor: colors.ink }}>
+            <Text style={{ fontFamily: fonts.bold, fontSize: 13, color: colors.white }}>You</Text>
+          </View>
+        ) : (
+          <TouchableOpacity
+            onPress={() => toggleFollow(item.id)}
+            accessibilityRole="button"
+            accessibilityLabel={isFollowing ? `Unfollow ${item.displayName}` : `Follow ${item.displayName}`}
+            accessibilityState={{ selected: isFollowing }}
+            style={{ minWidth: 86, minHeight: 40, paddingHorizontal: 12, borderRadius: 20, borderWidth: 1.5, borderColor: colors.ink, backgroundColor: isFollowing ? colors.ink : colors.white, alignItems: 'center', justifyContent: 'center' }}
+          >
+            <Text style={{ fontFamily: fonts.bold, fontSize: 13, color: isFollowing ? colors.white : colors.ink }}>{isFollowing ? 'Following' : 'Follow'}</Text>
+          </TouchableOpacity>
         )}
       </View>
     );
   };
 
-  return (
-    <View style={styles.mainContainer}>
-      
-      {/* USER PROFILE MODAL */}
-      <Modal visible={profileModalVisible} transparent={true} animationType="fade">
-        <TouchableOpacity style={styles.modalOverlay} onPress={() => setProfileModalVisible(false)} activeOpacity={1}>
-          <View style={styles.userPopupCard}>
-            {selectedProfile && (
-              <>
-                <View style={styles.popupAvatarCircle}>
-                  {selectedProfile.profilePic ? (
-                    <Image source={{ uri: selectedProfile.profilePic }} style={styles.popupAvatarImage} />
-                  ) : (
-                    <Text style={styles.popupAvatarText}>{selectedProfile.displayName[0].toUpperCase()}</Text>
-                  )}
-                </View>
-                <Text style={styles.popupName}>{selectedProfile.displayName}</Text>
-                
-                <View style={styles.popupTitlePill}>
-                  <Text style={styles.popupTitleText}>{getEcoTitle(selectedProfile.score)} • Rank #{selectedProfile.rank}</Text>
-                </View>
-
-                <View style={styles.popupStatsRow}>
-                  <View style={styles.popupStatBox}>
-                    <Ionicons name="leaf" size={20} color="#2D6A4F" />
-                    <Text style={styles.popupStatNum}>{selectedProfile.score}</Text>
-                    <Text style={styles.popupStatLabel}>Points</Text>
-                  </View>
-                  <View style={styles.popupStatBox}>
-                    <Ionicons name="checkmark-done-circle" size={20} color="#52B788" />
-                    <Text style={styles.popupStatNum}>{selectedProfile.questsCompletedCount}</Text>
-                    <Text style={styles.popupStatLabel}>Completed</Text>
-                  </View>
-                </View>
-
-                {selectedProfile.id !== auth.currentUser?.uid && (
-                  <TouchableOpacity 
-                    style={[styles.popupFollowBtn, selectedProfile.isFollowing && styles.popupFollowingBtn]} 
-                    onPress={() => handleToggleFollow(selectedProfile.id)}
-                  >
-                    <Text style={[styles.popupFollowText, selectedProfile.isFollowing && styles.popupFollowingText]}>
-                      {selectedProfile.isFollowing ? 'Following' : 'Follow User'}
-                    </Text>
-                  </TouchableOpacity>
-                )}
-              </>
-            )}
-          </View>
-        </TouchableOpacity>
-      </Modal>
-
-      {/* AWARD MODAL */}
-      <Modal visible={awardModalVisible} transparent={true} animationType="fade">
-        <TouchableOpacity style={styles.modalOverlay} onPress={() => setAwardModalVisible(false)} activeOpacity={1}>
-          <View style={styles.awardMenu}>
-            <Text style={styles.awardMenuTitle}>Send Climate Encouragement</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.awardRow}>
-              {AWARDS.map((award) => (
-                <TouchableOpacity key={award.id} style={styles.awardOption} onPress={() => giveAward(award)}>
-                  <Text style={{ fontSize: 30 }}>{award.icon}</Text>
-                  <Text style={styles.awardName}>{award.name}</Text>
-                  <Text style={styles.awardCost}>{award.cost} pts</Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-          </View>
-        </TouchableOpacity>
-      </Modal>
-
-      {/* HEADER */}
-      <View style={styles.headerBackground}>
-        <SafeAreaView edges={['top', 'left', 'right']}>
-          <View style={styles.headerContent}>
-            <View>
-              <Text style={styles.greetingText}>Global Network</Text>
-              <Text style={styles.headerTitle}>Community Hub</Text>
+  const renderPost = (item) => {
+    const isMine = item.userId === myId;
+    const liked = item.likedBy?.includes(myId);
+    const theme = difficultyTheme[item.dareDifficulty] || difficultyTheme.Medium;
+    const authorTier = getTier(item.authorScore);
+    const awards = Object.entries(item.awards || {}).filter(([, c]) => c > 0);
+    return (
+      <View style={{ backgroundColor: colors.white, borderRadius: 28, paddingTop: 12, borderWidth: 1.5, borderColor: colors.line, marginBottom: 14 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', paddingLeft: 12, paddingRight: 8 }}>
+          <TouchableOpacity
+            onPress={() => openMember(item.userId)}
+            style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 48, marginRight: 12 }}
+            accessibilityRole="button"
+            accessibilityLabel={`Open ${item.authorName}'s profile, ${authorTier.title}`}
+          >
+            <Avatar avatarKey={item.authorAvatar} seed={item.userId} size={44} />
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontFamily: fonts.bold, fontSize: 16, color: colors.ink }} numberOfLines={1}>{item.authorName}</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 1 }}>
+                <TierBadge tierKey={authorTier.key} size={13} />
+                <Text style={type.small}>{authorTier.title} · {formatDate(item.createdAt)}</Text>
+              </View>
             </View>
-            <View style={{ width: 40 }} />
+          </TouchableOpacity>
+          {isMine
+            ? <IconButton name="trash" label="Delete your post" onPress={() => deletePost(item.id)} bg="transparent" size={44} iconSize={20} />
+            : <IconButton name="flag" label="Report this post" onPress={() => reportPost(item.id)} bg="transparent" color={colors.muted} size={44} iconSize={20} />}
+        </View>
+
+        <View style={{ marginTop: 8, marginHorizontal: 16, marginBottom: 12, backgroundColor: theme.bg, borderRadius: 18, padding: 12 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <DifficultyIcon level={item.dareDifficulty} size={14} />
+            <Text style={type.eyebrow}>{theme.label}</Text>
           </View>
-        </SafeAreaView>
-      </View>
-
-      <View style={styles.tabWrapper}>
-        <View style={styles.tabContainer}>
-          <TouchableOpacity style={[styles.tabBtn, activeTab === 'feed' && styles.activeTab]} onPress={() => setActiveTab('feed')}>
-            <Text style={[styles.tabText, activeTab === 'feed' && styles.activeTabText]}>Posts</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.tabBtn, activeTab === 'leaderboard' && styles.activeTab]} onPress={() => setActiveTab('leaderboard')}>
-            <Text style={[styles.tabText, activeTab === 'leaderboard' && styles.activeTabText]}>Rankings</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      <View style={styles.contentContainer}>
-        <View style={styles.subTabContainer}>
-          <TouchableOpacity style={[styles.subTabBtn, feedFilter === 'global' && styles.activeSubTab]} onPress={() => setFeedFilter('global')}>
-            <Text style={[styles.subTabText, feedFilter === 'global' && styles.activeSubTabText]}>Global</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.subTabBtn, feedFilter === 'following' && styles.activeSubTab]} onPress={() => setFeedFilter('following')}>
-            <Text style={[styles.subTabText, feedFilter === 'following' && styles.activeSubTabText]}>Following</Text>
-          </TouchableOpacity>
+          <Text style={{ fontFamily: fonts.bold, fontSize: 16, color: colors.ink, marginTop: 3 }}>{item.dareTitle}</Text>
+          {item.dareDescription ? <Text style={[type.small, { marginTop: 2 }]}>{item.dareDescription}</Text> : null}
         </View>
 
-        {loading ? <ActivityIndicator size="large" color="#2D6A4F" style={{ marginTop: 40 }} /> : (
-          <FlatList
-            data={displayData}
-            keyExtractor={item => item.id}
-            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />}
-            onEndReached={handleLoadMore}
-            onEndReachedThreshold={0.4}
-            keyboardShouldPersistTaps="handled"
-            ListHeaderComponent={renderLeaderboardHeader}
-            ListFooterComponent={() => loadingMore ? <ActivityIndicator color="#2D6A4F" style={{ marginVertical: 15 }} /> : null}
-            ListEmptyComponent={() => (
-              <Text style={styles.emptyStateText}>
-                {feedFilter === 'following' 
-                  ? "You aren't following anyone yet! Find friends in the Rankings tab."
-                  : "No items found."}
-              </Text>
-            )}
-            renderItem={({ item }) => {
-              if (activeTab === 'leaderboard') {
-                const isMe = item.id === auth.currentUser?.uid;
-                const isFollowing = following.includes(item.id);
-                
-                const isTop3 = item.rank <= 3;
-                let rankDisplay = `#${item.rank}`;
-                let cardStyle = [styles.leaderCard, isMe && styles.myLeaderCard];
-                let rankStyle = [styles.rankNum, isMe && styles.myRankNum];
+        {item.imageURL ? (
+          <Image source={{ uri: item.imageURL }} style={{ marginHorizontal: 16, marginBottom: 12, aspectRatio: 1, borderRadius: 22, backgroundColor: colors.sage }} resizeMode="cover" accessibilityLabel={`Photo shared by ${item.authorName}`} />
+        ) : null}
 
-                if (item.rank === 1) {
-                  rankDisplay = '🌍 1';
-                  cardStyle.push({ backgroundColor: '#D8F3DC', borderColor: '#2D6A4F', borderWidth: 2 });
-                  rankStyle.push({ color: '#1B4332' });
-                } else if (item.rank === 2) {
-                  rankDisplay = '🌿 2';
-                  cardStyle.push({ backgroundColor: '#EBF4EE', borderColor: '#52B788', borderWidth: 2 });
-                  rankStyle.push({ color: '#2D6A4F' });
-                } else if (item.rank === 3) {
-                  rankDisplay = '🍃 3';
-                  cardStyle.push({ backgroundColor: '#F4F7F5', borderColor: '#74C69D', borderWidth: 2 });
-                  rankStyle.push({ color: '#52B788' });
-                }
+        {item.userCaption ? (
+          <Text style={[type.body, { marginHorizontal: 16, marginBottom: 12 }]}>
+            <Text style={{ fontFamily: fonts.bold }}>{item.authorName} </Text>{item.userCaption}
+          </Text>
+        ) : null}
 
-                return (
-                  <TouchableOpacity style={cardStyle} onPress={() => handleOpenUserProfile(item.id)}>
-                    <Text style={rankStyle}>{rankDisplay}</Text>
-                    {item.profilePic ? (
-                      <Image source={{ uri: item.profilePic }} style={styles.smallAvatar} />
-                    ) : (
-                      <View style={styles.smallAvatarPlaceholder}>
-                        <Text style={{ color: '#fff', fontSize: 10, fontWeight: 'bold' }}>{item.displayName[0].toUpperCase()}</Text>
-                      </View>
-                    )}
-                    <Text style={[styles.leaderName, isMe && styles.myLeaderName]}>{item.displayName} {getEcoEmoji(item.score)}</Text>
-                    <Text style={[styles.scoreText, isMe && styles.myScoreText, isTop3 && { color: '#333' }]}>{item.score} pts</Text>
-                    
-                    {isMe ? (
-                      <View style={styles.youBadge}>
-                        <Text style={styles.youBadgeText}>You</Text>
-                      </View>
-                    ) : (
-                      <TouchableOpacity 
-                        style={[styles.followBtn, isFollowing && styles.followingBtn]} 
-                        onPress={() => handleToggleFollow(item.id)}
-                      >
-                        <Text style={[styles.followBtnText, isFollowing && styles.followingBtnText]}>
-                          {isFollowing ? 'Following' : 'Follow'}
-                        </Text>
-                      </TouchableOpacity>
-                    )}
-                  </TouchableOpacity>
-                );
-              }
-
-              const isLiked = item.likedBy && item.likedBy.includes(auth.currentUser?.uid);
-              const isMyPost = item.userId === auth.currentUser?.uid;
-              const diffColor = item.dareDifficulty === 'Easy' ? '#52B788' : item.dareDifficulty === 'Medium' ? '#E9C46A' : '#E76F51';
-
+        {awards.length > 0 && (
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingHorizontal: 16, paddingBottom: 12 }}>
+            {awards.map(([id, count]) => {
+              const def = AWARDS.find(a => a.id === id);
+              if (!def) return null;
               return (
-                <View style={styles.postCard}>
-                  <TouchableOpacity style={styles.postHeader} onPress={() => handleOpenUserProfile(item.userId)}>
-                    {item.authorProfilePic ? (
-                      <Image source={{ uri: item.authorProfilePic }} style={styles.avatarImage} />
-                    ) : (
-                      <View style={styles.avatarPlaceholder}>
-                        <Text style={{ color: '#fff', fontWeight: 'bold' }}>{item.userDisplayName ? item.userDisplayName[0].toUpperCase() : '?'}</Text>
-                      </View>
-                    )}
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.postUser}>{item.userDisplayName} {getEcoEmoji(item.authorScore || 0)}</Text>
-                      <Text style={styles.postTime}>{item.createdAt.toLocaleDateString()}</Text>
-                    </View>
-                    
-                    {isMyPost ? (
-                      <TouchableOpacity onPress={() => handleDeletePost(item.id)} style={{ padding: 6 }}>
-                        <Ionicons name="trash-outline" size={20} color="#E76F51" />
-                      </TouchableOpacity>
-                    ) : (
-                      <TouchableOpacity onPress={() => handleReportPost(item.id)} style={{ padding: 6 }}>
-                        <Ionicons name="flag-outline" size={18} color="#888" />
-                      </TouchableOpacity>
-                    )}
-                  </TouchableOpacity>
-
-                  <View style={styles.postContext}>
-                    <View style={styles.titleRow}>
-                      <Text style={[styles.diffText, { color: diffColor }]}>{item.dareDifficulty}</Text>
-                      <Text style={styles.postTitle}>{item.dareTitle}</Text>
-                    </View>
-                    {item.dareDescription ? (
-                      <Text style={styles.postDesc}>{item.dareDescription}</Text>
-                    ) : null}
-                  </View>
-
-                  {item.imageURL ? (
-                    <Image source={{ uri: item.imageURL }} style={styles.postImage} resizeMode="cover" />
-                  ) : null}
-
-                  {item.userCaption ? (
-                    <View style={{ paddingHorizontal: 16, paddingTop: 12, paddingBottom: 4 }}>
-                      <Text style={{ fontSize: 14, color: '#333', lineHeight: 20 }}>
-                        <Text style={{ fontWeight: 'bold', color: '#1B4332' }}>{item.userDisplayName} </Text>
-                        {item.userCaption}
-                      </Text>
-                    </View>
-                  ) : null}
-
-                  {item.awards && Object.keys(item.awards).length > 0 && (
-                    <View style={styles.postAwardsContainer}>
-                      {Object.entries(item.awards).map(([awardId, count]) => {
-                        if (count > 0) {
-                          const awardDef = AWARDS.find(a => a.id === awardId);
-                          return awardDef ? (
-                            <View key={awardId} style={styles.postAwardBadge}>
-                              <Text style={styles.postAwardIcon}>{awardDef.icon}</Text>
-                              <Text style={styles.postAwardCount}>{count}</Text>
-                            </View>
-                          ) : null;
-                        }
-                        return null;
-                      })}
-                    </View>
-                  )}
-
-                  <View style={styles.socialBar}>
-                    <TouchableOpacity style={styles.socialBtn} onPress={() => handleLike(item)}>
-                      <Ionicons name={isLiked ? "heart" : "heart-outline"} size={22} color={isLiked ? "#E76F51" : "#444"} />
-                      <Text style={styles.socialText}>{item.likes || 0}</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={styles.socialBtn} onPress={() => { setPostToAward(item); setAwardModalVisible(true); }}>
-                      <Ionicons name="gift-outline" size={22} color="#2D6A4F" />
-                      <Text style={[styles.socialText, { color: '#2D6A4F' }]}>Gift</Text>
-                    </TouchableOpacity>
-                  </View>
+                <View key={id} style={{ flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: colors.ground, borderRadius: 16, paddingVertical: 4, paddingLeft: 4, paddingRight: 10 }}
+                  accessible accessibilityLabel={`${count} ${def.name} award${count > 1 ? 's' : ''}`}>
+                  <AwardCoin awardId={id} size={26} />
+                  <Text style={[type.label, { fontSize: 13 }]}>{def.name} ×{count}</Text>
                 </View>
               );
-            }}
-          />
+            })}
+          </View>
         )}
+
+        <View style={{ flexDirection: 'row', gap: 8, paddingHorizontal: 10, paddingTop: 6, paddingBottom: 10, borderTopWidth: 1.5, borderTopColor: '#EEF2EF' }}>
+          <TouchableOpacity
+            onPress={() => toggleLike(item)}
+            accessibilityRole="button"
+            accessibilityLabel={`${liked ? 'Unlike' : 'Like'} post, ${item.likes || 0} likes`}
+            accessibilityState={{ selected: !!liked }}
+            style={{ minHeight: 44, paddingHorizontal: 12, borderRadius: 22, backgroundColor: liked ? colors.mint : 'transparent', flexDirection: 'row', alignItems: 'center', gap: 6 }}
+          >
+            <Icon name="heart" size={20} filled={!!liked} />
+            <Text style={type.label}>{item.likes || 0}</Text>
+          </TouchableOpacity>
+          {!isMine && (
+            <TouchableOpacity
+              onPress={() => openGift(item)}
+              accessibilityRole="button"
+              accessibilityLabel={`Send ${item.authorName} an award`}
+              style={{ minHeight: 44, paddingHorizontal: 12, borderRadius: 22, flexDirection: 'row', alignItems: 'center', gap: 6 }}
+            >
+              <Icon name="gift" size={20} />
+              <Text style={type.label}>Award</Text>
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
+    );
+  };
+
+  const award = AWARDS.find(a => a.id === selectedAward);
+  const memberTier = member ? getTier(member.score) : null;
+
+  return (
+    <View style={{ flex: 1, backgroundColor: colors.ground }}>
+      {loading ? (
+        <ActivityIndicator size="large" color={colors.ink} style={{ marginTop: insets.top + 80 }} />
+      ) : (
+        <FlatList
+          data={displayData}
+          keyExtractor={item => item.id}
+          contentContainerStyle={{ paddingTop: insets.top + 16, paddingHorizontal: 20, paddingBottom: TAB_BAR_SPACE + insets.bottom }}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor={colors.ink} />}
+          onEndReached={handleLoadMore}
+          onEndReachedThreshold={0.4}
+          keyboardShouldPersistTaps="handled"
+          ListHeaderComponent={renderHeader()}
+          ListFooterComponent={loadingMore ? <ActivityIndicator color={colors.ink} style={{ marginVertical: 15 }} /> : null}
+          ListEmptyComponent={
+            <Text style={[type.bodyMuted, { textAlign: 'center', marginTop: 30, paddingHorizontal: 20 }]}>
+              {(activeTab === 'feed' ? feedFilter : rankFilter) === 'following'
+                ? "You aren't following anyone yet. Find people in Rankings."
+                : 'Nothing here yet.'}
+            </Text>
+          }
+          renderItem={({ item }) => (activeTab === 'leaderboard' ? renderLeaderRow(item) : renderPost(item))}
+        />
+      )}
+
+      {/* AWARD SHEET */}
+      <Sheet visible={!!postToAward} onClose={() => !giftBusy && setPostToAward(null)} labelledBy="Send an award">
+        {postToAward && award && (
+          <>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+              <Avatar avatarKey={postToAward.authorAvatar} seed={postToAward.userId} size={52} />
+              <View style={{ flex: 1 }}>
+                <Text style={[type.h2, { fontSize: 24 }]} accessibilityRole="header">Cheer on {postToAward.authorName}</Text>
+                <Text style={[type.bodyMuted, { marginTop: 3 }]}>The points go from your balance to theirs.</Text>
+              </View>
+            </View>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10 }} accessibilityRole="radiogroup">
+              {AWARDS.map(a => {
+                const on = a.id === selectedAward;
+                const affordable = myScore >= a.cost;
+                return (
+                  <TouchableOpacity
+                    key={a.id}
+                    onPress={() => setSelectedAward(a.id)}
+                    accessibilityRole="radio"
+                    accessibilityState={{ selected: on, disabled: !affordable }}
+                    accessibilityLabel={`${a.name} award, gives ${a.cost} points${affordable ? '' : ', not enough points'}`}
+                    style={{ width: '48%', alignItems: 'center', gap: 6, paddingVertical: 16, borderRadius: 22, backgroundColor: on ? colors.white : colors.ground, borderWidth: on ? 2.5 : 2, borderColor: on ? colors.ink : 'transparent', opacity: affordable ? 1 : 0.5 }}
+                  >
+                    {on && <View style={{ position: 'absolute', top: 10, right: 10, width: 24, height: 24, borderRadius: 12, backgroundColor: colors.ink, alignItems: 'center', justifyContent: 'center' }}><Icon name="check" size={14} color={colors.white} strokeWidth={3} /></View>}
+                    <AwardCoin awardId={a.id} size={60} />
+                    <Text style={{ fontFamily: fonts.bold, fontSize: 16, color: colors.ink }}>{a.name}</Text>
+                    <Text style={type.bodyMuted}>{a.cost} pts</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', backgroundColor: colors.cream, borderRadius: 16, padding: 12 }}>
+              <Text style={[type.body, { fontSize: 14 }]}>Your balance</Text>
+              <Text style={[type.label]}>{myScore} → {Math.max(0, myScore - award.cost)} pts</Text>
+            </View>
+            <Button label={`Send ${award.name} · ${award.cost} pts`} onPress={sendGift} loading={giftBusy} disabled={myScore < award.cost} />
+            <Button label="Cancel" variant="outline" onPress={() => setPostToAward(null)} disabled={giftBusy} style={{ borderWidth: 0 }} />
+          </>
+        )}
+      </Sheet>
+
+      {/* MEMBER SHEET */}
+      <Sheet visible={!!member} onClose={() => setMember(null)} labelledBy="Member profile">
+        {member && (
+          <>
+            <View style={{ alignItems: 'center', gap: 8 }}>
+              <Avatar avatarKey={member.avatar} seed={member.id} size={104} />
+              <Text style={[type.h1, { fontSize: 28 }]} accessibilityRole="header">{member.displayName}</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: colors.seafoam, borderRadius: 16, paddingVertical: 6, paddingHorizontal: 12 }}>
+                <TierBadge tierKey={memberTier.key} size={16} />
+                <Text style={type.label}>{memberTier.title}</Text>
+              </View>
+            </View>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              {[[member.score, 'Points'], [member.questsCompletedCount, 'Actions'], [`#${member.rank}`, 'Global']].map(([v, l]) => (
+                <View key={l} style={{ flex: 1, backgroundColor: colors.ground, borderRadius: 18, paddingVertical: 12, alignItems: 'center' }} accessible accessibilityLabel={`${l}: ${v}`}>
+                  <Text style={{ fontFamily: fonts.display, fontSize: 24, color: colors.ink }}>{v}</Text>
+                  <Text style={[type.small, { fontFamily: fonts.bold }]}>{l}</Text>
+                </View>
+              ))}
+            </View>
+            {member.recent.length > 0 && (
+              <View>
+                <Text style={[type.eyebrow, { fontSize: 13, marginBottom: 4 }]}>RECENT ACTIONS</Text>
+                {member.recent.map(p => (
+                  <View key={p.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderTopWidth: 1.5, borderTopColor: '#EEF2EF' }}>
+                    <DifficultyIcon level={p.dareDifficulty} size={18} />
+                    <Text style={{ flex: 1, fontFamily: fonts.bold, fontSize: 15, color: colors.ink }}>{p.dareTitle}</Text>
+                    <Text style={type.small}>{p.timestamp?.toDate ? formatDate(p.timestamp.toDate()) : ''}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+            {member.id !== myId && (
+              <Button
+                label={following.includes(member.id) ? 'Following' : `Follow ${member.displayName}`}
+                variant={following.includes(member.id) ? 'outline' : 'primary'}
+                onPress={() => toggleFollow(member.id)}
+              />
+            )}
+            <Button label="Close" variant="outline" onPress={() => setMember(null)} style={{ borderWidth: 0 }} />
+          </>
+        )}
+      </Sheet>
     </View>
   );
 }
-
-const styles = StyleSheet.create({
-  mainContainer: { flex: 1, backgroundColor: '#F4F7F5' },
-  
-  headerBackground: { backgroundColor: '#2D6A4F', paddingBottom: 25, borderBottomLeftRadius: 25, borderBottomRightRadius: 25, paddingTop: 10 },
-  headerContent: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 20, marginTop: 10 },
-  greetingText: { color: 'rgba(255,255,255,0.8)', fontSize: 14, fontWeight: '600' },
-  headerTitle: { color: '#fff', fontSize: 24, fontWeight: 'bold' },
-  
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center' },
-  userPopupCard: { width: '80%', backgroundColor: '#fff', borderRadius: 24, padding: 25, alignItems: 'center', shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 15 },
-  popupAvatarCircle: { width: 80, height: 80, borderRadius: 40, backgroundColor: '#2D6A4F', justifyContent: 'center', alignItems: 'center', marginBottom: 12 },
-  popupAvatarImage: { width: 80, height: 80, borderRadius: 40 },
-  popupAvatarText: { fontSize: 32, fontWeight: 'bold', color: '#fff' },
-  popupName: { fontSize: 20, fontWeight: 'bold', color: '#1B4332' },
-  popupTitlePill: { backgroundColor: '#EBF4EE', paddingHorizontal: 12, paddingVertical: 4, borderRadius: 12, marginTop: 6, marginBottom: 15 },
-  popupTitleText: { color: '#2D6A4F', fontWeight: 'bold', fontSize: 12 },
-  popupStatsRow: { flexDirection: 'row', width: '100%', justifyContent: 'space-around', marginBottom: 20 },
-  popupStatBox: { alignItems: 'center', backgroundColor: '#F9FBF9', padding: 12, borderRadius: 12, width: '45%', borderWidth: 1, borderColor: '#EBF4EE' },
-  popupStatNum: { fontSize: 18, fontWeight: 'bold', color: '#1B4332', marginTop: 4 },
-  popupStatLabel: { fontSize: 11, color: '#666', marginTop: 2 },
-  popupFollowBtn: { backgroundColor: '#2D6A4F', paddingVertical: 12, paddingHorizontal: 30, borderRadius: 20, width: '100%', alignItems: 'center' },
-  popupFollowingBtn: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#2D6A4F' },
-  popupFollowText: { color: '#fff', fontWeight: 'bold', fontSize: 15 },
-  popupFollowingText: { color: '#2D6A4F' },
-
-  tabWrapper: { backgroundColor: 'transparent', paddingHorizontal: 15, marginTop: -20 },
-  tabContainer: { flexDirection: 'row', backgroundColor: '#fff', borderRadius: 12, padding: 4, elevation: 3, shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 5 },
-  
-  awardMenu: { width: '90%', backgroundColor: '#fff', borderRadius: 24, padding: 25, alignItems: 'center', shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 15 },
-  awardMenuTitle: { fontSize: 18, fontWeight: 'bold', color: '#1B4332', marginBottom: 20 },
-  awardRow: { flexDirection: 'row', gap: 12 },
-  awardOption: { alignItems: 'center', padding: 15, borderRadius: 16, backgroundColor: '#F9FBF9', width: 90, borderWidth: 1, borderColor: '#EBF4EE' },
-  awardName: { fontSize: 12, fontWeight: '700', marginTop: 8, color: '#333', textAlign: 'center' },
-  awardCost: { fontSize: 11, color: '#2D6A4F', fontWeight: 'bold', marginTop: 4 },
-  
-  tabBtn: { flex: 1, paddingVertical: 10, alignItems: 'center', borderRadius: 10 },
-  activeTab: { backgroundColor: '#EBF4EE' },
-  tabText: { fontWeight: '700', color: '#888', fontSize: 14 },
-  activeTabText: { color: '#1B4332' },
-  
-  contentContainer: { flex: 1, paddingHorizontal: 15, paddingTop: 10 },
-  subTabContainer: { flexDirection: 'row', justifyContent: 'center', marginBottom: 15, gap: 10 },
-  subTabBtn: { paddingVertical: 8, paddingHorizontal: 20, borderRadius: 20, backgroundColor: '#EBF4EE' },
-  activeSubTab: { backgroundColor: '#2D6A4F' },
-  subTabText: { color: '#2D6A4F', fontWeight: 'bold', fontSize: 13 },
-  activeSubTabText: { color: '#fff' },
-  emptyStateText: { textAlign: 'center', marginTop: 40, color: '#888', fontStyle: 'italic', paddingHorizontal: 20 },
-
-  searchBar: { flexDirection: 'row', backgroundColor: '#fff', padding: 12, borderRadius: 12, alignItems: 'center', marginBottom: 15, shadowColor: '#000', shadowOpacity: 0.03, shadowRadius: 5, elevation: 1 },
-  input: { marginLeft: 10, flex: 1, fontSize: 16, color: '#333' },
-
-  pinnedUserSection: { marginBottom: 10 },
-  pinnedHeaderTitle: { fontSize: 11, fontWeight: 'bold', color: '#2D6A4F', letterSpacing: 1, marginBottom: 8, marginLeft: 4 },
-  pinnedCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#2D6A4F', padding: 16, borderRadius: 16, shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 6, elevation: 3 },
-  pinnedRankNum: { fontWeight: '900', color: '#74C69D', width: 45, fontSize: 16 },
-  pinnedName: { flex: 1, fontSize: 16, fontWeight: '900', color: '#fff', marginLeft: 10 },
-  pinnedScoreText: { fontWeight: '900', color: '#D8F3DC', fontSize: 16 },
-  sectionDivider: { height: 1, backgroundColor: '#EBF4EE', marginVertical: 15 },
-  
-  leaderCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', padding: 16, borderRadius: 16, marginBottom: 10, shadowColor: '#000', shadowOpacity: 0.04, shadowRadius: 6, elevation: 2 },
-  myLeaderCard: { backgroundColor: '#EBF4EE', borderColor: '#52B788', borderWidth: 1.5 },
-  rankNum: { fontWeight: '900', color: '#52B788', width: 45, fontSize: 16 },
-  myRankNum: { color: '#2D6A4F' },
-  leaderName: { flex: 1, fontSize: 16, fontWeight: '700', color: '#222', marginLeft: 10 },
-  myLeaderName: { color: '#1B4332', fontWeight: '900' },
-  scoreText: { fontWeight: '900', color: '#1B4332', fontSize: 16 },
-  myScoreText: { color: '#2D6A4F' },
-  
-  smallAvatar: { width: 30, height: 30, borderRadius: 15, backgroundColor: '#eee' },
-  smallAvatarPlaceholder: { width: 30, height: 30, borderRadius: 15, backgroundColor: '#52B788', justifyContent: 'center', alignItems: 'center' },
-
-  followBtn: { backgroundColor: '#EBF4EE', paddingVertical: 8, paddingHorizontal: 14, borderRadius: 15, marginLeft: 10 },
-  followingBtn: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#EBF4EE' },
-  followBtnText: { color: '#2D6A4F', fontWeight: 'bold', fontSize: 12 },
-  followingBtnText: { color: '#777' },
-
-  youBadge: { backgroundColor: '#52B788', paddingVertical: 6, paddingHorizontal: 14, borderRadius: 15, marginLeft: 10 },
-  youBadgeText: { color: '#fff', fontWeight: 'bold', fontSize: 12 },
-
-  postCard: { backgroundColor: '#fff', borderRadius: 20, marginBottom: 20, overflow: 'hidden', shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 4 },
-  postHeader: { flexDirection: 'row', alignItems: 'center', padding: 16 },
-  avatarImage: { width: 42, height: 42, borderRadius: 21, marginRight: 12, backgroundColor: '#eee' },
-  avatarPlaceholder: { width: 42, height: 42, borderRadius: 21, backgroundColor: '#52B788', justifyContent: 'center', alignItems: 'center', marginRight: 12 },
-  postUser: { fontWeight: '800', fontSize: 16, color: '#222' },
-  postTime: { color: '#888', fontSize: 12, marginTop: 2 },
-  postContext: { paddingHorizontal: 16, marginBottom: 16 },
-  titleRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 6 },
-  diffText: { fontWeight: '900', fontSize: 12, textTransform: 'uppercase', marginRight: 10, letterSpacing: 0.5 },
-  postTitle: { fontWeight: '700', color: '#1B4332', fontSize: 16, flexShrink: 1 },
-  postDesc: { color: '#555', fontSize: 14, lineHeight: 20 },
-  postImage: { width: '100%', aspectRatio: 1, backgroundColor: '#F4F7F5' }, 
-  
-  postAwardsContainer: { flexDirection: 'row', paddingHorizontal: 14, paddingTop: 10, paddingBottom: 4, flexWrap: 'wrap', gap: 8, backgroundColor: '#FAFCFA' },
-  postAwardBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', paddingVertical: 4, paddingHorizontal: 8, borderRadius: 12, borderWidth: 1, borderColor: '#EBF4EE' },
-  postAwardIcon: { fontSize: 14, marginRight: 4 },
-  postAwardCount: { fontSize: 13, fontWeight: 'bold', color: '#2D6A4F' },
-
-  socialBar: { flexDirection: 'row', padding: 14, alignItems: 'center', backgroundColor: '#FAFCFA', borderTopWidth: 1, borderTopColor: '#F0F0F0' },
-  socialBtn: { flexDirection: 'row', alignItems: 'center', marginRight: 24 },
-  socialText: { marginLeft: 6, fontSize: 14, fontWeight: '800', color: '#555' },
-});
