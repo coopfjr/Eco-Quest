@@ -1,0 +1,66 @@
+rules_version = '2';
+
+// Eco Quest Firestore security rules.
+// Deploy with:  firebase deploy --only firestore:rules
+// (or paste into Firebase console → Firestore Database → Rules → Publish)
+//
+// Limits of client-only rules: a determined user could still award themselves up to
+// 150 points per write. Fully preventing that needs a Cloud Function to credit points.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function scoreDelta() { return request.resource.data.get('score', 0) - resource.data.get('score', 0); }
+
+    // Quest library: everyone signed in can read. The app seeds/updates quests on
+    // launch, so writes are allowed but must look like a quest.
+    match /Quests/{questId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn()
+        && request.resource.data.points in [50, 100, 150]
+        && request.resource.data.difficulty in ['Easy', 'Medium', 'Hard']
+        && request.resource.data.title is string
+        && request.resource.data.title.size() <= 60;
+      allow delete: if signedIn();
+    }
+
+    match /Users/{uid} {
+      // Leaderboards, profiles and handle checks need to read other users.
+      allow read: if signedIn();
+
+      // New accounts start at 0 points.
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.get('score', 0) == 0;
+
+      // Owner: may update their own doc, but can gain at most 150 points per write
+      // (the value of a Hard quest). Spending points (swaps, tokens, gifts) is fine.
+      allow update: if signedIn() && request.auth.uid == uid && scoreDelta() <= 150;
+
+      // Another user sending a gift: may only add a fixed award value to score and
+      // giftPointsReceived, and nothing else.
+      allow update: if signedIn() && request.auth.uid != uid
+        && changed().hasOnly(['score', 'giftPointsReceived'])
+        && scoreDelta() in [10, 25, 50, 100]
+        && request.resource.data.get('giftPointsReceived', 0) - resource.data.get('giftPointsReceived', 0) == scoreDelta();
+
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /CommunityPosts/{postId} {
+      allow read: if signedIn();
+
+      // You can only post as yourself, with a caption of 120 characters or fewer.
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.get('userCaption', '').size() <= 120;
+
+      // Anyone signed in may like, report or award a post, but not edit its content.
+      allow update: if signedIn()
+        && changed().hasOnly(['likes', 'likedBy', 'flaggedCount', 'awards']);
+
+      // Only the author can delete their post.
+      allow delete: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+  }
+}

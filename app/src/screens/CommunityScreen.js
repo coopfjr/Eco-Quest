@@ -65,6 +65,8 @@ export default function CommunityScreen() {
   const [boards, setBoards] = useState({ tier: [], following: [], global: [] });
   const [myRanks, setMyRanks] = useState({ tier: null, following: null, global: null });
   const [feed, setFeed] = useState([]);
+  const [followingFeed, setFollowingFeed] = useState([]);
+  const [loadingFollowing, setLoadingFollowing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
   const [postToAward, setPostToAward] = useState(null);
@@ -155,14 +157,40 @@ export default function CommunityScreen() {
 
   useEffect(() => { loadData().then(() => setLoading(false)); }, [loadData]);
 
+  // Posts from people you follow, fetched directly (not just filtered from the latest
+  // page). 'in' queries take up to 30 ids, so ids are chunked. Sorting happens here
+  // to avoid needing a composite index.
+  const loadFollowingFeed = useCallback(async (ids) => {
+    if (!ids.length) { setFollowingFeed([]); return; }
+    setLoadingFollowing(true);
+    try {
+      const chunks = [];
+      for (let i = 0; i < ids.length; i += 30) chunks.push(ids.slice(i, i + 30));
+      const snaps = await Promise.all(chunks.map(c => getDocs(query(collection(db, 'CommunityPosts'), where('userId', 'in', c), limit(40)))));
+      const docs = snaps.flatMap(sn => sn.docs)
+        .sort((a, b) => (b.data().timestamp?.toMillis?.() || 0) - (a.data().timestamp?.toMillis?.() || 0))
+        .slice(0, 40);
+      setFollowingFeed(await hydratePosts(docs));
+    } catch (e) {
+      console.error('Following feed error:', e);
+    } finally {
+      setLoadingFollowing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'feed' && feedFilter === 'following') loadFollowingFeed(following);
+  }, [activeTab, feedFilter, following, loadFollowingFeed]);
+
   const handleRefresh = async () => {
     setRefreshing(true);
     await loadData();
+    if (feedFilter === 'following') await loadFollowingFeed(following);
     setRefreshing(false);
   };
 
   const handleLoadMore = async () => {
-    if (activeTab !== 'feed' || !lastFeedDoc || !hasMoreFeed || loadingMore) return;
+    if (activeTab !== 'feed' || feedFilter !== 'global' || !lastFeedDoc || !hasMoreFeed || loadingMore) return;
     setLoadingMore(true);
     try {
       const snap = await getDocs(query(collection(db, 'CommunityPosts'), orderBy('timestamp', 'desc'), startAfter(lastFeedDoc), limit(PAGE_SIZE)));
@@ -248,11 +276,13 @@ export default function CommunityScreen() {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     const liked = post.likedBy?.includes(user.uid);
     // Optimistic update so the heart responds instantly.
-    setFeed(prev => prev.map(p => p.id !== post.id ? p : {
+    const flip = (list) => list.map(p => p.id !== post.id ? p : {
       ...p,
       likes: (p.likes || 0) + (liked ? -1 : 1),
       likedBy: liked ? (p.likedBy || []).filter(id => id !== user.uid) : [...(p.likedBy || []), user.uid],
-    }));
+    });
+    setFeed(flip);
+    setFollowingFeed(flip);
     try {
       await updateDoc(doc(db, 'CommunityPosts', post.id), liked
         ? { likedBy: arrayRemove(user.uid), likes: increment(-1) }
@@ -312,7 +342,7 @@ export default function CommunityScreen() {
   const nextAbove = [...board].filter(u => u.score > myScore).sort((a, b) => a.score - b.score)[0];
 
   const displayData = activeTab === 'feed'
-    ? (feedFilter === 'global' ? feed : feed.filter(p => following.includes(p.userId)))
+    ? (feedFilter === 'global' ? feed : followingFeed)
     : (searchQuery ? board.filter(u => u.displayName.toLowerCase().includes(searchQuery.toLowerCase())) : board);
 
   const leagueTitle = rankFilter === 'tier' ? `${myTier.title} league` : rankFilter === 'following' ? 'You + people you follow' : 'Everyone';
@@ -519,7 +549,7 @@ export default function CommunityScreen() {
           onEndReachedThreshold={0.4}
           keyboardShouldPersistTaps="handled"
           ListHeaderComponent={renderHeader()}
-          ListFooterComponent={loadingMore ? <ActivityIndicator color={colors.ink} style={{ marginVertical: 15 }} /> : null}
+          ListFooterComponent={(loadingMore || loadingFollowing) ? <ActivityIndicator color={colors.ink} style={{ marginVertical: 15 }} /> : null}
           ListEmptyComponent={
             <Text style={[type.bodyMuted, { textAlign: 'center', marginTop: 30, paddingHorizontal: 20 }]}>
               {(activeTab === 'feed' ? feedFilter : rankFilter) === 'following'

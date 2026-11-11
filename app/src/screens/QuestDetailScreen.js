@@ -61,7 +61,7 @@ export default function QuestDetailScreen({ navigation, route }) {
 
     try {
       if (postPayload) await addDoc(collection(db, 'CommunityPosts'), { ...postPayload, timestamp: serverTimestamp() });
-      const success = await completeDailyQuest(quest.questId, quest.points);
+      const success = await completeDailyQuest(quest.questId, quest.points, quest.assignedDate);
       if (!success) {
         Alert.alert('Already done', 'This quest was already completed.');
         navigation.goBack();
@@ -69,7 +69,7 @@ export default function QuestDetailScreen({ navigation, route }) {
       }
       navigation.replace('Done', { quest, prevScore, shared: shareToFeed, offline: false });
     } catch (error) {
-      await queueOfflinePost(postPayload, { questId: quest.questId, points: quest.points });
+      await queueOfflinePost(postPayload, { questId: quest.questId, points: quest.points, assignedDate: quest.assignedDate });
       navigation.replace('Done', { quest, prevScore, shared: shareToFeed, offline: true });
     } finally {
       setSubmitting(false);

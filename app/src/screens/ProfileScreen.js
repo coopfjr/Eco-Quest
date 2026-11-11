@@ -1,16 +1,19 @@
 // src/screens/ProfileScreen.js
 import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, Alert, ActivityIndicator, ScrollView } from 'react-native';
+import { View, Text, TouchableOpacity, Alert, ActivityIndicator, ScrollView, TextInput } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { doc, onSnapshot, updateDoc } from 'firebase/firestore';
-import { signOut } from 'firebase/auth';
+import { doc, onSnapshot, updateDoc, deleteDoc, collection, query, where, getDocs, writeBatch } from 'firebase/firestore';
+import { signOut, deleteUser, reauthenticateWithCredential, EmailAuthProvider } from 'firebase/auth';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { validateHandle, isHandleTaken, HANDLE_RULES } from '../profileUtils';
 import { auth, db } from '../firebaseConfig';
 import { ECO_TIERS, getTier, getNextTier, getTierProgress } from '../ecoTiers';
 import { CLIMATE_TAGS } from './OnboardingScreen';
+import { getSwapBalance } from '../dailyQuestUtils';
 import { AVATARS, Avatar } from '../ui/Critters';
 import { TierBadge } from '../ui/Badges';
 import Icon from '../ui/Icons';
-import { Button, Chip, ProgressBar, Sheet } from '../ui/components';
+import { Button, Chip, ProgressBar, Sheet, Field, inputStyle } from '../ui/components';
 import { TAB_BAR_SPACE } from '../ui/TabBar';
 import { colors, fonts, type } from '../ui/theme';
 
@@ -22,6 +25,12 @@ export default function ProfileScreen() {
   const [savingPrefs, setSavingPrefs] = useState(false);
   const [titlesOpen, setTitlesOpen] = useState(false);
   const [avatarOpen, setAvatarOpen] = useState(false);
+  const [handleOpen, setHandleOpen] = useState(false);
+  const [newHandle, setNewHandle] = useState('');
+  const [savingHandle, setSavingHandle] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     const user = auth.currentUser;
@@ -68,6 +77,49 @@ export default function ProfileScreen() {
     }
   };
 
+  const saveHandle = async () => {
+    const check = validateHandle(newHandle);
+    if (!check.ok) { Alert.alert('Check your handle', check.message); return; }
+    if (check.handle === userData?.userDisplayName) { setHandleOpen(false); return; }
+    setSavingHandle(true);
+    try {
+      if (await isHandleTaken(check.handle, uid)) {
+        Alert.alert('Handle taken', 'That handle is already claimed. Please choose another.');
+        return;
+      }
+      await updateDoc(doc(db, 'Users', uid), { userDisplayName: check.handle, userDisplayNameLower: check.lower });
+      setHandleOpen(false);
+    } catch (e) {
+      Alert.alert('Error', 'Could not change your handle.');
+    } finally {
+      setSavingHandle(false);
+    }
+  };
+
+  // Deletes the user's posts, their profile and their login. Asks for the password
+  // first because Firebase only allows account deletion after a recent sign-in.
+  const deleteAccount = async () => {
+    const user = auth.currentUser;
+    if (!user || !deletePassword) return;
+    setDeleting(true);
+    try {
+      await reauthenticateWithCredential(user, EmailAuthProvider.credential(user.email, deletePassword));
+      const posts = await getDocs(query(collection(db, 'CommunityPosts'), where('userId', '==', user.uid)));
+      for (let i = 0; i < posts.docs.length; i += 450) {
+        const batch = writeBatch(db);
+        posts.docs.slice(i, i + 450).forEach(d => batch.delete(d.ref));
+        await batch.commit();
+      }
+      await deleteDoc(doc(db, 'Users', user.uid));
+      await AsyncStorage.removeItem('@ecoquest_offline_posts_queue');
+      await deleteUser(user);
+    } catch (e) {
+      setDeleting(false);
+      if (e.code === 'auth/wrong-password' || e.code === 'auth/invalid-credential') Alert.alert('Wrong password', 'That password is not correct.');
+      else Alert.alert('Could not delete account', 'Please check your connection and try again.');
+    }
+  };
+
   const logout = () => {
     Alert.alert('Log out?', 'You can log back in any time.', [
       { text: 'Cancel', style: 'cancel' },
@@ -90,7 +142,15 @@ export default function ProfileScreen() {
               <Icon name="edit" size={18} color={colors.white} />
             </TouchableOpacity>
           </View>
-          <Text style={[type.h1, { marginTop: 4 }]} accessibilityRole="header">{userData?.userDisplayName || 'EcoActioner'}</Text>
+          <TouchableOpacity
+            onPress={() => { setNewHandle(userData?.userDisplayName || ''); setHandleOpen(true); }}
+            accessibilityRole="button"
+            accessibilityLabel={`Your handle is ${userData?.userDisplayName || 'not set'}. Change handle`}
+            style={{ flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 44, marginTop: 4 }}
+          >
+            <Text style={type.h1} accessibilityRole="header">{userData?.userDisplayName || 'EcoActioner'}</Text>
+            <Icon name="edit" size={18} />
+          </TouchableOpacity>
           <TouchableOpacity
             onPress={() => setTitlesOpen(true)}
             accessibilityRole="button"
@@ -110,7 +170,7 @@ export default function ProfileScreen() {
 
         <View style={{ padding: 20, gap: 16 }}>
           <View style={{ flexDirection: 'row', gap: 10 }}>
-            {[[score, 'Points'], [userData?.questsCompletedCount || 0, 'Actions'], [userData?.rerollTokens || 0, 'Swaps left']].map(([v, l]) => (
+            {[[score, 'Points'], [userData?.questsCompletedCount || 0, 'Actions'], [getSwapBalance(userData), 'Swaps left']].map(([v, l]) => (
               <View key={l} style={{ flex: 1, backgroundColor: colors.white, borderRadius: 20, paddingVertical: 14, alignItems: 'center', borderWidth: 1.5, borderColor: colors.line }} accessible accessibilityLabel={`${l}: ${v}`}>
                 <Text style={{ fontFamily: fonts.display, fontSize: 26, color: colors.ink }}>{v}</Text>
                 <Text style={[type.small, { fontFamily: fonts.bold }]}>{l}</Text>
@@ -136,6 +196,14 @@ export default function ProfileScreen() {
           >
             <Icon name="logout" size={22} />
             <Text style={{ fontFamily: fonts.bold, fontSize: 16, color: colors.ink }}>Log out</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => { setDeletePassword(''); setDeleteOpen(true); }}
+            accessibilityRole="button"
+            style={{ flexDirection: 'row', alignItems: 'center', gap: 12, minHeight: 56, paddingHorizontal: 18 }}
+          >
+            <Icon name="trash" size={22} color="#9A3412" />
+            <Text style={{ fontFamily: fonts.bold, fontSize: 16, color: '#9A3412' }}>Delete account</Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
@@ -171,6 +239,38 @@ export default function ProfileScreen() {
           })}
         </View>
         <Button label="Close" variant="outline" onPress={() => setTitlesOpen(false)} style={{ borderWidth: 0 }} />
+      </Sheet>
+
+      {/* CHANGE HANDLE SHEET */}
+      <Sheet visible={handleOpen} onClose={() => !savingHandle && setHandleOpen(false)} labelledBy="Change your handle">
+        <Text style={[type.h1, { fontSize: 28 }]} accessibilityRole="header">Change your handle</Text>
+        <Field label="Public handle" hint={`${HANDLE_RULES} Must be unique.`}>
+          <TextInput style={inputStyle} value={newHandle} onChangeText={setNewHandle} maxLength={20} autoCapitalize="none" autoCorrect={false}
+            accessibilityLabel="Public handle" returnKeyType="done" onSubmitEditing={saveHandle} />
+        </Field>
+        <Text style={type.small}>Your new handle shows on all your posts, including older ones.</Text>
+        <Button label="Save handle" onPress={saveHandle} loading={savingHandle} />
+        <Button label="Cancel" variant="outline" onPress={() => setHandleOpen(false)} disabled={savingHandle} style={{ borderWidth: 0 }} />
+      </Sheet>
+
+      {/* DELETE ACCOUNT SHEET */}
+      <Sheet visible={deleteOpen} onClose={() => !deleting && setDeleteOpen(false)} labelledBy="Delete your account">
+        <Text style={[type.h1, { fontSize: 28 }]} accessibilityRole="header">Delete your account?</Text>
+        <Text style={type.body}>This permanently removes your profile, points, titles and every post you've shared. It can't be undone.</Text>
+        <Field label="Enter your password to confirm">
+          <TextInput style={inputStyle} value={deletePassword} onChangeText={setDeletePassword} secureTextEntry autoComplete="password"
+            textContentType="password" accessibilityLabel="Password" />
+        </Field>
+        <TouchableOpacity
+          onPress={deleteAccount}
+          disabled={!deletePassword || deleting}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: !deletePassword || deleting, busy: deleting }}
+          style={{ minHeight: 56, borderRadius: 28, backgroundColor: '#9A3412', alignItems: 'center', justifyContent: 'center', opacity: !deletePassword ? 0.45 : 1 }}
+        >
+          {deleting ? <ActivityIndicator color={colors.white} /> : <Text style={{ fontFamily: fonts.bold, fontSize: 17, color: colors.white }}>Delete my account</Text>}
+        </TouchableOpacity>
+        <Button label="Keep my account" variant="outline" onPress={() => setDeleteOpen(false)} disabled={deleting} style={{ borderWidth: 0 }} />
       </Sheet>
 
       {/* AVATAR PICKER SHEET */}

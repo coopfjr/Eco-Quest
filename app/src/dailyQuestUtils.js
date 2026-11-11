@@ -1,7 +1,12 @@
 // src/dailyQuestUtils.js
-// Every function that changes points, tokens or quest state runs inside a Firestore
+// Every function that changes points, swaps or quest state runs inside a Firestore
 // transaction, so a double tap or two devices cannot spend or credit points twice
 // (design document 2.3.8).
+//
+// Swaps come from two pots:
+//   freeSwaps    – reset to FREE_REROLLS_PER_DAY each day (unused ones don't carry over)
+//   rerollTokens – bought with points; they never expire
+// Swapping uses free swaps first, then bought tokens, then points.
 import { db, auth } from './firebaseConfig.js';
 import { collection, doc, getDocs, runTransaction } from 'firebase/firestore';
 
@@ -9,14 +14,18 @@ const FREE_REROLLS_PER_DAY = 2;
 const DIFFICULTY_LEVELS = ['Easy', 'Medium', 'Hard'];
 const REROLL_COST = 50;
 const TOKEN_COST = 50;
+const LATE_COMPLETION_MEMORY = 30;
 
-// Local calendar date (YYYY-MM-DD), so the day changes at the user's midnight, not at UTC midnight.
+// Local calendar date (YYYY-MM-DD), so the day changes at the user's midnight.
 const getTodayDate = () => {
   const d = new Date();
   const mm = String(d.getMonth() + 1).padStart(2, '0');
   const dd = String(d.getDate()).padStart(2, '0');
   return `${d.getFullYear()}-${mm}-${dd}`;
 };
+
+// Total swaps available, for display.
+const getSwapBalance = (userData) => (userData?.freeSwaps || 0) + (userData?.rerollTokens || 0);
 
 const toQuestObj = (q, todayDate) => ({
   questId: q.id,
@@ -33,6 +42,15 @@ const pickRandom = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const fetchQuestPool = async () => {
   const snap = await getDocs(collection(db, 'Quests'));
   return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+};
+
+// Prefer quests matching the user's interests and not shown yesterday, falling back
+// gracefully when the pool is small.
+const choose = (candidates, interests, avoidIds) => {
+  const fresh = candidates.filter(q => !avoidIds.has(q.id));
+  const base = fresh.length > 0 ? fresh : candidates;
+  const preferred = base.filter(q => q.tags && q.tags.some(tag => interests.includes(tag)));
+  return pickRandom(preferred.length > 0 ? preferred : base);
 };
 
 const assignDailyQuests = async () => {
@@ -53,7 +71,8 @@ const assignDailyQuests = async () => {
       if (!userData) {
         userData = {
           score: 0,
-          rerollTokens: FREE_REROLLS_PER_DAY,
+          freeSwaps: FREE_REROLLS_PER_DAY,
+          rerollTokens: 0,
           questsCompletedCount: 0,
           createdAt: new Date().toISOString(),
           dailyQuests: [],
@@ -67,26 +86,33 @@ const assignDailyQuests = async () => {
         return existing;
       }
 
-      const userInterests = userData.interests || [];
+      const interests = userData.interests || [];
+      const yesterdayIds = new Set(existing.map(q => q.questId));
       const assignedIds = new Set();
       const newDailyQuests = [];
 
       for (const level of DIFFICULTY_LEVELS) {
-        const available = pool.filter(q => q.difficulty === level && !assignedIds.has(q.id));
-        if (available.length === 0) continue;
-        const preferred = available.filter(q => q.tags && q.tags.some(tag => userInterests.includes(tag)));
-        const selected = preferred.length > 0 ? pickRandom(preferred) : pickRandom(available);
+        const candidates = pool.filter(q => q.difficulty === level && !assignedIds.has(q.id));
+        if (candidates.length === 0) continue;
+        const selected = choose(candidates, interests, yesterdayIds);
         newDailyQuests.push(toQuestObj(selected, todayDate));
         assignedIds.add(selected.id);
       }
 
-      const updates = {
+      // Migration: before freeSwaps existed, rerollTokens held the 2 daily swaps plus
+      // any bought tokens. Keep only the bought part.
+      let purchased = userData.rerollTokens || 0;
+      if (userData.freeSwaps === undefined && userDoc.exists()) {
+        purchased = Math.max(0, purchased - FREE_REROLLS_PER_DAY);
+      }
+
+      t.set(userDocRef, {
         ...userData,
         dailyQuests: newDailyQuests,
         lastQuestAssignment: todayDate,
-        rerollTokens: FREE_REROLLS_PER_DAY,
-      };
-      t.set(userDocRef, updates);
+        freeSwaps: FREE_REROLLS_PER_DAY,
+        rerollTokens: purchased,
+      });
       return newDailyQuests;
     });
   } catch (error) {
@@ -95,7 +121,10 @@ const assignDailyQuests = async () => {
   }
 };
 
-const completeDailyQuest = async (questId, points) => {
+// assignedDate lets a completion that was queued offline still count after midnight,
+// when that quest is no longer in today's list. Each late completion is remembered so
+// it can never be credited twice.
+const completeDailyQuest = async (questId, points, assignedDate) => {
   const user = auth.currentUser;
   if (!user || !questId) return false;
 
@@ -108,14 +137,28 @@ const completeDailyQuest = async (questId, points) => {
       const userData = userDoc.data();
 
       const quests = [...(userData.dailyQuests || [])];
-      const index = quests.findIndex(q => q.questId === questId);
-      if (index === -1 || quests[index].completed) return false;
+      const index = quests.findIndex(q => q.questId === questId && (!assignedDate || q.assignedDate === assignedDate));
 
-      quests[index] = { ...quests[index], completed: true };
+      if (index !== -1) {
+        if (quests[index].completed) return false;
+        quests[index] = { ...quests[index], completed: true };
+        t.update(userDocRef, {
+          dailyQuests: quests,
+          score: (userData.score || 0) + points,
+          questsCompletedCount: (userData.questsCompletedCount || 0) + 1,
+        });
+        return true;
+      }
+
+      // Not in today's list: only credit it if it was a real quest from an earlier day.
+      if (!assignedDate || assignedDate >= getTodayDate()) return false;
+      const key = `${assignedDate}:${questId}`;
+      const late = userData.lateCompletions || [];
+      if (late.includes(key)) return false;
       t.update(userDocRef, {
-        dailyQuests: quests,
         score: (userData.score || 0) + points,
         questsCompletedCount: (userData.questsCompletedCount || 0) + 1,
+        lateCompletions: [...late, key].slice(-LATE_COMPLETION_MEMORY),
       });
       return true;
     });
@@ -139,10 +182,11 @@ const rerollDailyQuest = async (currentQuestId, targetMode = 'same') => {
       if (!userDoc.exists()) return { success: false, message: 'User not found.' };
       const userData = userDoc.data();
 
-      let availableTokens = userData.rerollTokens || 0;
+      let freeSwaps = userData.freeSwaps || 0;
+      let purchased = userData.rerollTokens || 0;
       let currentScore = userData.score || 0;
       const quests = [...(userData.dailyQuests || [])];
-      const userInterests = userData.interests || [];
+      const interests = userData.interests || [];
 
       const questIndex = quests.findIndex(q => q.questId === currentQuestId);
       if (questIndex === -1) return { success: false, message: 'Quest not found.' };
@@ -150,43 +194,37 @@ const rerollDailyQuest = async (currentQuestId, targetMode = 'same') => {
 
       const currentDiff = quests[questIndex].difficulty;
       let targetDifficulty = currentDiff;
-
       if (targetMode === 'downgrade') {
         if (currentDiff === 'Hard') targetDifficulty = 'Medium';
         else if (currentDiff === 'Medium') targetDifficulty = 'Easy';
-        else return { success: false, message: 'Quest is already at Easy difficulty.' };
+        else return { success: false, message: 'Quest is already Easy.' };
       } else if (targetMode === 'upgrade') {
         if (currentDiff === 'Easy') targetDifficulty = 'Medium';
         else if (currentDiff === 'Medium') targetDifficulty = 'Hard';
-        else return { success: false, message: 'Quest is already at Hard difficulty.' };
+        else return { success: false, message: 'Quest is already Hard.' };
       }
 
       const heldIds = new Set(quests.map(q => q.questId));
-      const available = pool.filter(q => q.difficulty === targetDifficulty && !heldIds.has(q.id));
-      if (available.length === 0) {
-        return { success: false, message: `No alternative ${targetDifficulty} quests available.` };
+      const candidates = pool.filter(q => q.difficulty === targetDifficulty && !heldIds.has(q.id));
+      if (candidates.length === 0) {
+        return { success: false, message: `No other ${targetDifficulty} quests are available.` };
       }
 
-      // Check what the user can pay with before charging anything.
-      if (availableTokens > 0) {
-        availableTokens -= 1;
-      } else if (currentScore >= REROLL_COST) {
-        currentScore -= REROLL_COST;
-      } else {
-        return { success: false, message: `Requires ${REROLL_COST} points or 1 token.` };
-      }
+      if (freeSwaps > 0) freeSwaps -= 1;
+      else if (purchased > 0) purchased -= 1;
+      else if (currentScore >= REROLL_COST) currentScore -= REROLL_COST;
+      else return { success: false, message: `Swapping needs 1 token or ${REROLL_COST} points.` };
 
-      const preferred = available.filter(q => q.tags && q.tags.some(tag => userInterests.includes(tag)));
-      const newQuest = preferred.length > 0 ? pickRandom(preferred) : pickRandom(available);
+      const newQuest = choose(candidates, interests, new Set());
       const newQuestObj = toQuestObj(newQuest, getTodayDate());
       quests[questIndex] = newQuestObj;
 
-      t.update(userDocRef, { dailyQuests: quests, rerollTokens: availableTokens, score: currentScore });
-      return { success: true, message: `Swapped to (${targetDifficulty}): ${newQuest.title}`, newQuest: newQuestObj };
+      t.update(userDocRef, { dailyQuests: quests, freeSwaps, rerollTokens: purchased, score: currentScore });
+      return { success: true, message: `Swapped to ${newQuest.title}.`, newQuest: newQuestObj };
     });
   } catch (error) {
     console.error('Error rerolling quest:', error);
-    return { success: false, message: 'Error during reroll.' };
+    return { success: false, message: 'Something went wrong during the swap.' };
   }
 };
 
@@ -202,21 +240,22 @@ const useSkipToGainReroll = async () => {
       if (!userDoc.exists()) return { success: false, message: 'User not found.' };
       const userData = userDoc.data();
       const currentScore = userData.score || 0;
-
       if (currentScore < TOKEN_COST) {
-        return { success: false, message: `Need ${TOKEN_COST} points to buy a token.` };
+        return { success: false, message: `You need ${TOKEN_COST} points to buy a token.` };
       }
-
       t.update(userDocRef, {
         rerollTokens: (userData.rerollTokens || 0) + 1,
         score: currentScore - TOKEN_COST,
       });
-      return { success: true, message: 'Purchased 1 Reroll Token.' };
+      return { success: true, message: 'Bought 1 swap token.' };
     });
   } catch (error) {
     console.error('Error buying token:', error);
-    return { success: false, message: 'Transaction failed.' };
+    return { success: false, message: 'Purchase failed.' };
   }
 };
 
-export { assignDailyQuests, getTodayDate, completeDailyQuest, rerollDailyQuest, useSkipToGainReroll, REROLL_COST, TOKEN_COST };
+export {
+  assignDailyQuests, getTodayDate, getSwapBalance, completeDailyQuest, rerollDailyQuest, useSkipToGainReroll,
+  REROLL_COST, TOKEN_COST, FREE_REROLLS_PER_DAY,
+};

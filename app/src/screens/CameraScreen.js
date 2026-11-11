@@ -88,10 +88,10 @@ export default function CameraScreen({ navigation, route }) {
     };
     try {
       await addDoc(collection(db, 'CommunityPosts'), { ...postPayload, timestamp: serverTimestamp() });
-      if (quest) await completeDailyQuest(quest.questId, quest.points);
+      if (quest) await completeDailyQuest(quest.questId, quest.points, quest.assignedDate);
       navigation.replace('Done', { quest, prevScore, shared: true, offline: false });
     } catch (e) {
-      await queueOfflinePost(postPayload, quest ? { questId: quest.questId, points: quest.points } : null);
+      await queueOfflinePost(postPayload, quest ? { questId: quest.questId, points: quest.points, assignedDate: quest.assignedDate } : null);
       navigation.replace('Done', { quest, prevScore, shared: true, offline: true });
     } finally {
       setUploading(false);

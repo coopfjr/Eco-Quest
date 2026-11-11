@@ -5,7 +5,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { db, auth } from '../firebaseConfig';
 import { doc, onSnapshot } from 'firebase/firestore';
 import * as Haptics from 'expo-haptics';
-import { rerollDailyQuest, useSkipToGainReroll, assignDailyQuests, getTodayDate, REROLL_COST, TOKEN_COST } from '../dailyQuestUtils';
+import { rerollDailyQuest, useSkipToGainReroll, assignDailyQuests, getTodayDate, getSwapBalance, REROLL_COST, TOKEN_COST, FREE_REROLLS_PER_DAY } from '../dailyQuestUtils';
 import { getDailyTip } from '../ecoTips';
 import { getTier, getNextTier, getTierProgress } from '../ecoTiers';
 import { DIFFICULTY_CRITTER, Avatar } from '../ui/Critters';
@@ -147,13 +147,19 @@ export default function QuestHubScreen({ navigation }) {
   }
 
   const score = userData?.score || 0;
-  const tokens = userData?.rerollTokens || 0;
+  const tokens = getSwapBalance(userData);
+  const freeSwaps = userData?.freeSwaps || 0;
+  const bought = userData?.rerollTokens || 0;
   const quests = userData?.dailyQuests || [];
   const doneCount = quests.filter(q => q.completed).length;
   const tier = getTier(score);
   const nextTier = getNextTier(score);
   const canAffordSwap = tokens > 0 || score >= REROLL_COST;
-  const swapCostLabel = tokens > 0 ? `Uses 1 of your ${tokens} swap tokens. No points spent.` : `Costs ${REROLL_COST} points.`;
+  const swapCostLabel = freeSwaps > 0
+    ? `Uses 1 of your ${freeSwaps} free swaps today. No points spent.`
+    : bought > 0
+      ? `Uses 1 of your ${bought} bought tokens. No points spent.`
+      : `Costs ${REROLL_COST} of your ${score} points.`;
   const name = userData?.userDisplayName || 'there';
 
   const openSwap = (quest) => {
@@ -259,6 +265,13 @@ export default function QuestHubScreen({ navigation }) {
           </View>
         </View>
 
+        {quests.length === 0 && (
+          <View style={{ backgroundColor: colors.white, borderRadius: 26, padding: 20, alignItems: 'center', gap: 10, borderWidth: 1.5, borderColor: colors.line }}>
+            <Text style={[type.body, { textAlign: 'center' }]}>Today's quests haven't loaded yet. Check your connection and try again.</Text>
+            <Button label="Try again" variant="outline" onPress={() => assignDailyQuests()} style={{ minHeight: 48 }} />
+          </View>
+        )}
+
         {quests.map(quest => (
           <QuestCard
             key={quest.questId}
@@ -272,7 +285,7 @@ export default function QuestHubScreen({ navigation }) {
         <View style={{ backgroundColor: colors.white, borderRadius: 22, paddingVertical: 14, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', gap: 12, borderWidth: 1.5, borderColor: colors.line }}>
           <View style={{ flex: 1 }}>
             <Text style={{ fontFamily: fonts.bold, fontSize: 15, color: colors.ink }}>Need more swaps?</Text>
-            <Text style={[type.small, { marginTop: 2 }]}>You get 2 free each day. Extra tokens cost {TOKEN_COST} pts.</Text>
+            <Text style={[type.small, { marginTop: 2 }]}>You get {FREE_REROLLS_PER_DAY} free swaps a day. Bought tokens cost {TOKEN_COST} pts and never expire.</Text>
           </View>
           <Button label={`Buy · ${TOKEN_COST}`} variant="outline" onPress={buyToken} disabled={score < TOKEN_COST || busy}
             accessibilityLabel={`Buy one swap token for ${TOKEN_COST} points`} style={{ minHeight: 44, paddingHorizontal: 16 }} />

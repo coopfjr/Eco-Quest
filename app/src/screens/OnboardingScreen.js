@@ -5,9 +5,10 @@
 import React, { useState } from 'react';
 import { View, Text, TextInput, Alert, ScrollView, KeyboardAvoidingView, Platform, TouchableOpacity } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { doc, updateDoc, collection, query, where, getDocs } from 'firebase/firestore';
+import { doc, updateDoc } from 'firebase/firestore';
 import { signOut } from 'firebase/auth';
 import { db, auth } from '../firebaseConfig';
+import { validateHandle, isHandleTaken, HANDLE_RULES } from '../profileUtils';
 import { Sprout, Drop, Tree, Earth, AVATARS, Avatar, DEFAULT_AVATAR } from '../ui/Critters';
 import { TierBadge } from '../ui/Badges';
 import Icon from '../ui/Icons';
@@ -58,19 +59,22 @@ export default function OnboardingScreen() {
   };
 
   const next = () => {
-    if (step === 1 && !displayName.trim()) {
-      Alert.alert('Pick a handle', 'Please enter a public username to continue.');
-      return;
+    if (step === 1) {
+      const check = validateHandle(displayName);
+      if (!check.ok) {
+        Alert.alert('Check your handle', check.message);
+        return;
+      }
     }
     setStep(s => Math.min(3, s + 1));
   };
   const back = () => (step === 0 ? signOut(auth).catch(() => {}) : setStep(s => s - 1));
 
   const finish = async () => {
-    const trimmedName = displayName.trim();
-    if (!trimmedName) {
+    const check = validateHandle(displayName);
+    if (!check.ok) {
       setStep(1);
-      Alert.alert('Pick a handle', 'Please enter a public username.');
+      Alert.alert('Check your handle', check.message);
       return;
     }
     const user = auth.currentUser;
@@ -78,8 +82,7 @@ export default function OnboardingScreen() {
 
     setLoading(true);
     try {
-      const snap = await getDocs(query(collection(db, 'Users'), where('userDisplayName', '==', trimmedName)));
-      if (snap.docs.some(d => d.id !== user.uid)) {
+      if (await isHandleTaken(check.handle, user.uid)) {
         setLoading(false);
         setStep(1);
         Alert.alert('Handle taken', 'That handle is already claimed. Please choose another.');
@@ -87,7 +90,8 @@ export default function OnboardingScreen() {
       }
       await updateDoc(doc(db, 'Users', user.uid), {
         onboardingComplete: true,
-        userDisplayName: trimmedName,
+        userDisplayName: check.handle,
+        userDisplayNameLower: check.lower,
         avatar,
         interests: selectedInterests,
       });
@@ -154,7 +158,7 @@ export default function OnboardingScreen() {
               })}
             </View>
             <View style={{ marginTop: 22 }}>
-              <Field label="Public handle" hint="Up to 20 characters. Must be unique.">
+              <Field label="Public handle" hint={`${HANDLE_RULES} Must be unique.`}>
                 <TextInput style={inputStyle} value={displayName} onChangeText={setDisplayName} maxLength={20} autoCapitalize="none"
                   placeholder="e.g. cooper" placeholderTextColor={colors.muted} accessibilityLabel="Public handle" returnKeyType="done" />
               </Field>

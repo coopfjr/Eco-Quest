@@ -42,7 +42,7 @@ export const syncOfflinePosts = async () => {
           });
         }
         if (questInfo) {
-          await completeDailyQuest(questInfo.questId, questInfo.points);
+          await completeDailyQuest(questInfo.questId, questInfo.points, questInfo.assignedDate);
         }
       } catch (err) {
         remainingQueue.push(item);

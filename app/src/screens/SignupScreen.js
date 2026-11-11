@@ -27,7 +27,8 @@ export default function SignupScreen({ navigation }) {
       await setDoc(doc(db, 'Users', user.uid), {
         email: user.email,
         score: 0,
-        rerollTokens: 2,
+        freeSwaps: 2,
+        rerollTokens: 0,
         questsCompletedCount: 0,
         createdAt: new Date().toISOString(),
         dailyQuests: [],
