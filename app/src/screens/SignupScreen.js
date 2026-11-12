@@ -54,7 +54,7 @@ export default function SignupScreen({ navigation }) {
 
         <View style={{ padding: 24, gap: 16 }}>
           <Field label="Email">
-            <TextInput style={inputStyle} value={email} onChangeText={setEmail} placeholder="you@school.ca" placeholderTextColor={colors.muted}
+            <TextInput style={inputStyle} value={email} onChangeText={setEmail} placeholder="you@gmail.com" placeholderTextColor={colors.muted}
               keyboardType="email-address" autoCapitalize="none" autoComplete="email" textContentType="emailAddress" accessibilityLabel="Email" />
           </Field>
           <Field label="Password">
